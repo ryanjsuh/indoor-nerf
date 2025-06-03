@@ -6,10 +6,12 @@ import numpy as np
 import pdb
 
 from utils import get_voxel_vertices
+from quantization import FakeQuantizer, LearnedBitwidthQuantizer
 
 class HashEmbedder(nn.Module):
     def __init__(self, bounding_box, n_levels=16, n_features_per_level=2,\
-                log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
+                log2_hashmap_size=19, base_resolution=16, finest_resolution=512,
+                use_quantization=False, quantization_bits=8): #Added two parameters for quantization
         super(HashEmbedder, self).__init__()
         self.bounding_box = bounding_box
         self.n_levels = n_levels
@@ -18,6 +20,7 @@ class HashEmbedder(nn.Module):
         self.base_resolution = torch.tensor(base_resolution)
         self.finest_resolution = torch.tensor(finest_resolution)
         self.out_dim = self.n_levels * self.n_features_per_level
+        self.use_quantization = use_quantization #Added for A-CAQ
 
         self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
 
@@ -27,6 +30,15 @@ class HashEmbedder(nn.Module):
         for i in range(n_levels):
             nn.init.uniform_(self.embeddings[i].weight, a=-0.0001, b=0.0001)
             # self.embeddings[i].weight.data.zero_()
+        
+        #Add quantizing for each level if True
+        if use_quantization:
+            self.quantizers = nn.ModuleList([
+                FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+                for i in range(n_levels)
+            ])
+        else:
+            self.quantizers = None
         
 
     def trilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
@@ -65,6 +77,10 @@ class HashEmbedder(nn.Module):
                                                 resolution, self.log2_hashmap_size)
             
             voxel_embedds = self.embeddings[i](hashed_voxel_indices)
+
+            # Apply quantization if applicable
+            if self.use_quantization and self.quantizers is not None:
+                voxel_embedds = self.quantizers[i](voxel_embedds)
 
             x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
             x_embedded_all.append(x_embedded)
