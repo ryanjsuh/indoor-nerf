@@ -210,6 +210,10 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # Get quantization parameters from args
+    use_quantization = getattr(args, 'use_quantization', False)
+    quantization_bits = getattr(args, 'quantization_bits', 8)
+
     embed_fn, input_ch = get_embedder(args.multires, args, i=args.i_embed)
     if args.i_embed==1:
         # hashed embedding table
@@ -230,7 +234,9 @@ def create_nerf(args):
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views).to(device)
+                        input_ch=input_ch, input_ch_views=input_ch_views,
+                        use_quantization=use_quantization,
+                        quantization_bits=quantization_bits).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -246,7 +252,9 @@ def create_nerf(args):
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views).to(device)
+                        input_ch=input_ch, input_ch_views=input_ch_views,
+                        use_quantization=use_quantization,
+                        quantization_bits=quantization_bits).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -613,7 +621,13 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--tv-loss-weight", type=float, default=1e-6,
                         help='learning rate')
-
+    
+    #adding quantization options
+    parser.add_argument("--use_quantization", action='store_true',
+                        help='enable quantization for hash embeddings and MLP')
+    parser.add_argument("--quantization_bits", type=int, default=8,
+                        help='number of bits for quantization (default: 8)')
+    
     return parser
 
 
