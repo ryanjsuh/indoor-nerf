@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from tqdm import tqdm, trange
 import pickle
+import glob
 
 import matplotlib.pyplot as plt
 
@@ -1122,10 +1123,15 @@ def train():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
-            if images is not None and i_test is not None:  # ADD THIS BLOCK
-                test_psnr = -10. * np.log10(np.mean((rgbs - images[i_test])**2))
-                metrics_logger.log_test_metrics(i, test_psnr)  
-
+            
+            psnr_files = glob.glob(os.path.join(testsavedir, "test_psnrs_avg*.pkl"))
+            if psnr_files and len(psnr_files) > 0:
+                with open(psnr_files[0], 'rb') as f:
+                    test_psnrs = pickle.load(f)
+                    avg_test_psnr = sum(test_psnrs) / len(test_psnrs)
+                    metrics_logger.log_test_metrics(i, avg_test_psnr)
+                    print(f"Logged test PSNR: {avg_test_psnr:.2f}")
+            
 
 
         if i%args.i_print==0:
