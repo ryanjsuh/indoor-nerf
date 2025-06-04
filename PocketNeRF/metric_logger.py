@@ -80,7 +80,7 @@ class MetricsLogger:
         # Log quantization metrics if applicable
         if quantizers:
             self.log_quantization_metrics(quantizers)
-    
+
     def log_quantization_metrics(self, quantizers):
         """Log detailed quantization metrics"""
         if not quantizers:
@@ -110,11 +110,15 @@ class MetricsLogger:
             self.metrics['avg_bitwidth'].append(np.mean(all_bits))
             self.metrics['bitwidth_distribution'].append(all_bits.copy())
             
-            if embed_bits:
-                self.quant_metrics['embed_bits'].append(np.mean(embed_bits))
-            if mlp_bits:
-                self.quant_metrics['mlp_bits'].append(np.mean(mlp_bits))
-    
+            # Always append values (use None if not available)
+            self.quant_metrics['embed_bits'].append(np.mean(embed_bits) if embed_bits else None)
+            self.quant_metrics['mlp_bits'].append(np.mean(mlp_bits) if mlp_bits else None)
+            self.quant_metrics['activation_bits'].append(None)  # Not implemented yet
+            self.quant_metrics['weight_bits'].append(None)  # Not implemented yet
+            self.quant_metrics['quantization_error'].append(None)  # Not implemented yet
+            self.quant_metrics['bit_operations'].append(None)  # Not implemented yet
+            self.quant_metrics['model_size'].append(None)  # Not implemented yet
+
     def log_test_metrics(self, iteration, psnr, ssim=None, lpips=None):
         """Log test set evaluation metrics"""
         self.metrics['test_psnr'].append((iteration, psnr))
@@ -184,11 +188,22 @@ class MetricsLogger:
         })
         df_main.to_csv(os.path.join(self.metrics_dir, f'main_metrics_{iteration}.csv'), index=False)
         
-        # Quantization metrics
-        if self.quant_metrics['embed_bits']:
-            df_quant = pd.DataFrame(self.quant_metrics)
+        # Quantization metrics - only export if we have data
+        if any(self.quant_metrics[key] for key in self.quant_metrics):
+            # Find the maximum length among all lists
+            max_len = max(len(v) for v in self.quant_metrics.values() if v)
+            
+            # Pad shorter lists with None
+            padded_metrics = {}
+            for key, values in self.quant_metrics.items():
+                if values:
+                    padded_metrics[key] = values + [None] * (max_len - len(values))
+                else:
+                    padded_metrics[key] = [None] * max_len
+            
+            df_quant = pd.DataFrame(padded_metrics)
             df_quant.to_csv(os.path.join(self.metrics_dir, f'quant_metrics_{iteration}.csv'), index=False)
-    
+
     def plot_training_curves(self, save_path=None):
         """Create publication-quality training curves"""
         if save_path is None:
