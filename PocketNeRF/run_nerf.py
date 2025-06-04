@@ -706,6 +706,13 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
 
+    # *** FIX: Always enable normal prediction if structural priors are enabled ***
+    # This prevents architecture mismatch when structural priors activate
+    if args.use_structural_priors and not args.predict_normals:
+        print(f"🔧 AUTOMATICALLY ENABLING NORMAL PREDICTION for structural priors")
+        print(f"   (Structural priors require normal prediction from network creation)")
+        args.predict_normals = True
+
     # Load data
     K = None
     if args.dataset_type == 'llff':
@@ -1017,15 +1024,6 @@ def train():
         if args.use_structural_priors and i >= args.structural_loss_start_iter:
             # Announce when structural priors first activate
             if i == args.structural_loss_start_iter:
-                # *** DYNAMICALLY ENABLE NORMAL PREDICTION AT STRUCTURAL PRIORS ACTIVATION ***
-                # This prevents the network architecture from being changed during base training
-                if not args.predict_normals:
-                    print(f"\n🔧 ENABLING NORMAL PREDICTION for structural priors at iteration {i}")
-                    args.predict_normals = True
-                    # Update render kwargs to enable normal prediction
-                    render_kwargs_train['predict_normals'] = True
-                    render_kwargs_test['predict_normals'] = True
-                
                 time_metrics['structural_priors_start_time'] = time.time()
                 structural_activation_time = time_metrics['structural_priors_start_time'] - time_metrics['start_time']
                 
@@ -1037,7 +1035,7 @@ def train():
                 print(f"   Planarity Weight: {args.planarity_weight}")
                 print(f"   Manhattan Weight: {args.manhattan_weight}")
                 print(f"   Normal Consistency Weight: {args.normal_consistency_weight}")
-                print(f"   Predict Normals: {args.predict_normals} (dynamically enabled)")
+                print(f"   Predict Normals: {args.predict_normals} (enabled from network creation)")
                 print(f"   Ramp Duration: {args.structural_loss_ramp_iters} iterations")
                 print(f"   Overfitting Threshold: {args.overfitting_threshold} dB")
                 print(f"📈 Current Baseline PSNR: {psnr.item():.2f} dB")

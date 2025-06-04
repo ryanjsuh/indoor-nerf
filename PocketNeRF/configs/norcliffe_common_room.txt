@@ -1,4 +1,4 @@
-expname = norcliffe_structural
+expname = norcliffe_structural_fixed
 basedir = ./logs
 dataset_type = blender
 
@@ -19,12 +19,11 @@ precrop_frac = 0.5
 half_res = False
 
 # *** FIXED CONFIGURATION TO PREVENT BASE OVERFITTING ***
-# Main issue: Normal prediction was enabled before structural priors activated,
-# causing network architecture changes and training instability.
+# UPDATED: With architectural fixes, normal prediction can be enabled from start
 
 # PocketNeRF Structural Priors V2 - Fixed Configuration
 use_structural_priors = True
-predict_normals = False              # *** DISABLED until base training stabilizes ***
+predict_normals = True               # *** ENABLED from start (fixes applied) ***
 
 # DRASTICALLY reduced weights to prevent overfitting (20-50x smaller)
 depth_prior_weight = 0.0              # Disabled - causing issues

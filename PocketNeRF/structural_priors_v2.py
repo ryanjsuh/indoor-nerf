@@ -480,45 +480,71 @@ def combine_structural_losses_v2(depth_pred: torch.Tensor,
     loss_dict = {}
     total_loss = torch.tensor(0.0, device=device)
     
+    # *** ENHANCED ERROR HANDLING ***
+    # Check for None or invalid normals
+    if normals is None:
+        print("⚠️  Structural priors: normals is None, skipping normal-based losses")
+        return total_loss, {'error': 'normals_none'}
+    
+    # Check for invalid normal shapes
+    if normals.dim() != 2 or normals.shape[-1] != 3:
+        print(f"⚠️  Structural priors: invalid normals shape {normals.shape}, expected [N, 3]")
+        return total_loss, {'error': f'invalid_normals_shape_{normals.shape}'}
+    
+    # Check for empty normals
+    if normals.shape[0] == 0:
+        print("⚠️  Structural priors: empty normals tensor, skipping")
+        return total_loss, {'error': 'empty_normals'}
+    
+    # Check for depth-normal size mismatch
+    if depth_pred.shape[0] != normals.shape[0]:
+        print(f"⚠️  Structural priors: depth-normal size mismatch {depth_pred.shape[0]} vs {normals.shape[0]}")
+        return total_loss, {'error': f'size_mismatch_{depth_pred.shape[0]}_{normals.shape[0]}'}
+    
     # Initialize components if not provided
     if manhattan_frame_estimator is None:
         manhattan_frame_estimator = ManhattanFrameEstimator(confidence_threshold=0.4)  # More conservative
     if semantic_detector is None:
         semantic_detector = SemanticPlaneDetector(normal_threshold=0.5)  # More conservative
     
-    # Detect semantic planes
-    semantic_info = semantic_detector.detect_planes(depth_pred, normals, spatial_coords)
-    
-    # Estimate Manhattan frame
-    normal_confidences = torch.norm(normals, dim=-1)  # Use normal magnitude as confidence
-    manhattan_frame = manhattan_frame_estimator.estimate_frame(normals, normal_confidences)
-    
-    # Manhattan loss with semantic awareness
-    if 'manhattan' in weights and normals is not None:
-        manhattan_loss, manhattan_dict = manhattan_sdf_loss(
-            normals, depth_pred, manhattan_frame, semantic_info, weights['manhattan']
-        )
-        loss_dict.update({f'manhattan_{k}': v for k, v in manhattan_dict.items()})
-        total_loss += manhattan_loss
-    
-    # Structured planarity loss
-    if 'planarity' in weights:
-        planarity_loss = structured_planarity_loss(
-            depth_pred, normals, rays_d, semantic_info, weights['planarity']
-        )
-        loss_dict['planarity'] = planarity_loss
-        total_loss += planarity_loss
-    
-    # Spatial normal consistency
-    if 'normal_consistency' in weights and normals is not None:
-        consistency_loss = spatial_normal_consistency_loss(
-            normals, depth_pred, spatial_coords, weights['normal_consistency']
-        )
-        loss_dict['normal_consistency'] = consistency_loss
-        total_loss += consistency_loss
-    
-    # Add semantic info to loss dict for logging
-    loss_dict['semantic_floor_count'] = semantic_info['n_floor']
-    loss_dict['semantic_wall_count'] = semantic_info['n_wall']
+    try:
+        # Detect semantic planes with error handling
+        semantic_info = semantic_detector.detect_planes(depth_pred, normals, spatial_coords)
+        
+        # Estimate Manhattan frame with error handling
+        normal_confidences = torch.norm(normals, dim=-1)  # Use normal magnitude as confidence
+        manhattan_frame = manhattan_frame_estimator.estimate_frame(normals, normal_confidences)
+        
+        # Manhattan loss with semantic awareness
+        if 'manhattan' in weights and normals is not None:
+            manhattan_loss, manhattan_dict = manhattan_sdf_loss(
+                normals, depth_pred, manhattan_frame, semantic_info, weights['manhattan']
+            )
+            loss_dict.update({f'manhattan_{k}': v for k, v in manhattan_dict.items()})
+            total_loss += manhattan_loss
+        
+        # Structured planarity loss
+        if 'planarity' in weights:
+            planarity_loss = structured_planarity_loss(
+                depth_pred, normals, rays_d, semantic_info, weights['planarity']
+            )
+            loss_dict['planarity'] = planarity_loss
+            total_loss += planarity_loss
+        
+        # Spatial normal consistency
+        if 'normal_consistency' in weights and normals is not None:
+            consistency_loss = spatial_normal_consistency_loss(
+                normals, depth_pred, spatial_coords, weights['normal_consistency']
+            )
+            loss_dict['normal_consistency'] = consistency_loss
+            total_loss += consistency_loss
+        
+        # Add semantic info to loss dict for logging
+        loss_dict['semantic_floor_count'] = semantic_info['n_floor']
+        loss_dict['semantic_wall_count'] = semantic_info['n_wall']
+        
+    except Exception as e:
+        print(f"⚠️  Structural priors computation failed: {e}")
+        return torch.tensor(0.0, device=device), {'error': str(e)}
     
     return total_loss, loss_dict 
