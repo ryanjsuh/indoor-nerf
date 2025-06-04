@@ -246,7 +246,7 @@ class NeRFSmall(nn.Module):
             #Quantize weights, only first layer for now
             if self.use_quantization and l == 0 and self.sigma_weight_quantizer is not None:
                 #Create temp quantized weight
-                weight = self.simga_net[l].weight
+                weight = self.sigma_net[l].weight
                 quantized_weight = self.sigma_weight_quantizer(weight)
                 h = F.linear(h, quantized_weight, None)
             else:
