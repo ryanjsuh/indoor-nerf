@@ -19,7 +19,11 @@ from run_nerf_helpers import *
 from optimizer import MultiOptimizer
 from radam import RAdam
 from loss import sigma_sparsity_loss, total_variation_loss
-from structural_priors import combine_structural_losses 
+from structural_priors_v2 import (
+    combine_structural_losses_v2, 
+    ManhattanFrameEstimator, 
+    SemanticPlaneDetector
+)
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -905,6 +909,10 @@ def train():
     psnr_list = []
     time_list = []
     
+    # Initialize structural priors components (V2)
+    manhattan_estimator = ManhattanFrameEstimator(confidence_threshold=0.6)
+    semantic_detector = SemanticPlaneDetector(normal_threshold=0.7)
+    
     # PocketNeRF Time Tracking for Final Report
     time_metrics = {
         'start_time': time.time(),
@@ -1075,20 +1083,33 @@ def train():
             
             if depth_pred is not None:
                 try:
-                    # Compute structural losses with improved implementations
-                    structural_loss, structural_loss_dict = combine_structural_losses(
+                    # Get spatial coordinates for spatial awareness
+                    if not use_batching and N_rand is not None:
+                        # Extract 2D coordinates from the ray selection
+                        spatial_coords = select_coords.float()  # [N_rand, 2]
+                    else:
+                        spatial_coords = None
+                    
+                    # Compute structural losses with V2 implementation
+                    structural_loss, structural_loss_dict = combine_structural_losses_v2(
                         depth_pred=depth_pred,
-                        points=points,
                         normals=normals,
                         rays_d=rays_d,
-                        depth_prior=None,  # Can be added later if you have depth priors
-                        height=None,  # For full image rendering
-                        width=None,   # For full image rendering
-                        weights=structural_weights
+                        spatial_coords=spatial_coords,
+                        weights=structural_weights,
+                        manhattan_frame_estimator=manhattan_estimator,
+                        semantic_detector=semantic_detector
                     )
                     
                     structural_loss_total = structural_loss.item() if torch.is_tensor(structural_loss) else structural_loss
                     loss = loss + structural_loss
+                    
+                    # Enhanced logging for V2 implementation
+                    if i % args.i_print == 0:
+                        floor_count = structural_loss_dict.get('semantic_floor_count', 0)
+                        wall_count = structural_loss_dict.get('semantic_wall_count', 0)
+                        if floor_count > 0 or wall_count > 0:
+                            print(f"   🏗️  Semantics: {floor_count} floor, {wall_count} wall points detected")
                     
                     # Log ramping progress
                     if i % args.i_print == 0 and ramp_progress < 1.0:
@@ -1097,8 +1118,9 @@ def train():
                 except Exception as e:
                     # Don't break training if structural priors fail
                     if i % args.i_print == 0:
-                        print(f"  ⚠️  Structural priors failed: {e}")
-                        
+                        print(f"  ⚠️  Structural priors V2 failed: {e}")
+                        print(f"      This is expected during initial iterations as geometry stabilizes")
+
         elif args.use_structural_priors and i < args.structural_loss_start_iter:
             # Show countdown to structural priors activation with improved messages
             if i % args.i_print == 0 and i > args.structural_loss_start_iter - 500:
