@@ -1010,6 +1010,40 @@ def train():
             if i>1000:
                 args.tv_loss_weight = 0.0
 
+        # Additional regularization for few-shot scenarios to prevent base overfitting
+        if i > 500:  # After initial convergence
+            # L2 weight decay on network parameters (stronger for few-shot)
+            l2_reg = torch.tensor(0.0, device=device)
+            for param in render_kwargs_train['network_fn'].parameters():
+                l2_reg += torch.norm(param, p=2)
+            if render_kwargs_train['network_fine'] is not None:
+                for param in render_kwargs_train['network_fine'].parameters():
+                    l2_reg += torch.norm(param, p=2)
+            
+            # Apply weight decay (stronger than typical)
+            weight_decay_strength = 1e-6 if i < 2000 else 5e-6  # Increase over time
+            loss = loss + weight_decay_strength * l2_reg
+            
+            # Gradient penalty to encourage smoother solutions
+            if i % 10 == 0:  # Every 10 iterations
+                # Sample some rays for gradient penalty
+                penalty_rays = min(64, N_rand // 4)
+                if penalty_rays > 0:
+                    penalty_indices = torch.randperm(N_rand)[:penalty_rays]
+                    penalty_batch_rays = torch.stack([batch_rays[0][penalty_indices], batch_rays[1][penalty_indices]], 0)
+                    
+                    # Enable gradients for gradient penalty
+                    penalty_batch_rays.requires_grad_(True)
+                    penalty_rgb, penalty_depth, _, _ = render(H, W, K, chunk=args.chunk, rays=penalty_batch_rays,
+                                                            verbose=False, retraw=False, **render_kwargs_train)
+                    
+                    # Compute gradient penalty
+                    if penalty_rgb.requires_grad:
+                        gradients = torch.autograd.grad(outputs=penalty_rgb.sum(), inputs=penalty_batch_rays,
+                                                       create_graph=True, retain_graph=True, only_inputs=True)[0]
+                        gradient_penalty = torch.mean(torch.norm(gradients, p=2, dim=-1))
+                        loss = loss + 1e-4 * gradient_penalty
+
         # Add PocketNeRF structural priors
         structural_loss_total = 0.0
         structural_loss_dict = {}
@@ -1134,6 +1168,10 @@ def train():
 
         loss.backward()
         # pdb.set_trace()
+        
+        # Gradient clipping to prevent instability (especially important for few-shot)
+        torch.nn.utils.clip_grad_norm_(grad_vars, max_norm=1.0)
+        
         optimizer.step()
 
         # NOTE: IMPORTANT!
@@ -1256,6 +1294,24 @@ def train():
                 # Rough estimate: test PSNR is typically lower than train, use a heuristic
                 estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Observed ~12dB gap
                 args._last_test_psnr = max(10.0, estimated_test_psnr)  # Floor at 10dB
+            
+            # Early overfitting detection for base HashNeRF (before structural priors)
+            if i >= 1000 and i < args.structural_loss_start_iter:
+                recent_train_psnr = np.mean(psnr_list[-5:])
+                estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Rough estimate
+                
+                # More aggressive overfitting detection for base training
+                base_overfitting_threshold = 10.0  # Stricter threshold for base
+                if recent_train_psnr - estimated_test_psnr > base_overfitting_threshold:
+                    print(f"\n🚨 BASE HASHNERF OVERFITTING DETECTED @ {i} (before structural priors!)")
+                    print(f"   Train PSNR: {recent_train_psnr:.1f} dB")
+                    print(f"   Estimated Test PSNR: {estimated_test_psnr:.1f} dB") 
+                    print(f"   Gap: {recent_train_psnr - estimated_test_psnr:.1f} dB > {base_overfitting_threshold:.1f} dB")
+                    print(f"   ⚠️  This suggests the base model overfits with only {len(i_train)} training views")
+                    print(f"   📋 Consider: lower learning rate, more regularization, or data augmentation")
+                    
+                    # Store this for later reference
+                    args._last_test_psnr = estimated_test_psnr
 
         if i%args.i_print==0:
             # Enhanced logging for PocketNeRF monitoring

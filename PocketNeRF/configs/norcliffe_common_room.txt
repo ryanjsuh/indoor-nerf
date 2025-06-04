@@ -37,3 +37,13 @@ structural_loss_ramp_iters = 5000     # 25%
 # Aggressive overfitting detection
 overfitting_threshold = 5.0          # Very sensitive threshold
 min_structural_weight = 0.00001      # Floor to prevent zero
+
+# Base HashNeRF Anti-Overfitting Settings
+lrate = 1e-4                         # Reduced from default 5e-4 (5x smaller)
+sparse_loss_weight = 5e-10           # Increased sparsity regularization
+tv_loss_weight = 5e-6                # Increased total variation regularization
+
+# Disable expensive operations to prevent crashes
+i_video = 50000                      # Disable video rendering (was 5000)
+i_weights = 5000                     # Less frequent checkpoints  
+i_testset = 2000                     # More frequent test evaluation
