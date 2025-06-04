@@ -17,7 +17,7 @@ class ManhattanFrameEstimator:
     Based on "Surface Normal Clustering for Implicit Representation of Manhattan Scenes"
     """
     
-    def __init__(self, confidence_threshold: float = 0.7):
+    def __init__(self, confidence_threshold: float = 0.5):  # Reduced from 0.7 for more stable detection
         self.confidence_threshold = confidence_threshold
         self.manhattan_frame = None
         self.frame_confidence = 0.0
@@ -37,27 +37,34 @@ class ManhattanFrameEstimator:
         normals = F.normalize(normals, dim=-1)
         
         if confidences is not None:
-            # Filter by confidence
+            # Filter by confidence with more lenient threshold
             mask = confidences > self.confidence_threshold
-            if torch.sum(mask) < 10:  # Need minimum normals
+            if torch.sum(mask) < 20:  # Increased minimum requirement
                 return torch.eye(3, device=device)
             normals = normals[mask]
         
+        # Need sufficient normals for stable clustering
+        if normals.shape[0] < 30:
+            return torch.eye(3, device=device)
+        
         # Cluster normals into 3 dominant directions
-        # Use a simplified clustering approach for efficiency
         cluster_centers = self._cluster_normals(normals)
         
         if cluster_centers is not None:
             # Ensure orthogonality using SVD
-            U, _, Vt = torch.svd(cluster_centers.T)
-            manhattan_frame = U @ Vt
-            
-            # Ensure positive determinant (proper rotation)
-            if torch.det(manhattan_frame) < 0:
-                manhattan_frame[:, -1] *= -1
+            try:
+                U, _, Vt = torch.svd(cluster_centers.T)
+                manhattan_frame = U @ Vt
                 
-            self.manhattan_frame = manhattan_frame
-            return manhattan_frame
+                # Ensure positive determinant (proper rotation)
+                if torch.det(manhattan_frame) < 0:
+                    manhattan_frame[:, -1] *= -1
+                    
+                self.manhattan_frame = manhattan_frame
+                return manhattan_frame
+            except:
+                # SVD can fail with degenerate inputs
+                return torch.eye(3, device=device)
         else:
             # Fallback to identity
             return torch.eye(3, device=device)
@@ -101,14 +108,14 @@ class SemanticPlaneDetector:
     Inspired by ManhattanSDF approach.
     """
     
-    def __init__(self, depth_threshold: float = 0.1, normal_threshold: float = 0.8):
+    def __init__(self, depth_threshold: float = 0.1, normal_threshold: float = 0.6):
         self.depth_threshold = depth_threshold
         self.normal_threshold = normal_threshold
         
     def detect_planes(self, depth_map: torch.Tensor, normals: torch.Tensor, 
                      image_coords: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
-        Detect semantic planes from depth and normals.
+        Detect semantic planes from depth and normals with stability improvements.
         
         Args:
             depth_map: Rendered depth [N_rays]
@@ -121,22 +128,50 @@ class SemanticPlaneDetector:
         device = depth_map.device
         n_rays = depth_map.shape[0]
         
-        # Normalize normals
+        # Normalize normals and add stability check
         normals_norm = F.normalize(normals, dim=-1)
         
-        # Detect floor (upward facing normals)
+        # Filter out very small normals (unstable predictions)
+        normal_magnitude = torch.norm(normals, dim=-1)
+        stable_mask = normal_magnitude > 0.1  # Only use confident normal predictions
+        
+        if stable_mask.sum() < 10:  # Not enough stable normals
+            return {
+                'floor_mask': torch.zeros(n_rays, dtype=torch.bool, device=device),
+                'wall_mask': torch.zeros(n_rays, dtype=torch.bool, device=device),
+                'wall_clusters': {},
+                'n_floor': 0,
+                'n_wall': 0
+            }
+        
+        # Apply stability mask
+        stable_normals = normals_norm[stable_mask]
+        
+        # Detect floor (upward facing normals) - more conservative threshold
         up_vector = torch.tensor([0, 0, 1], device=device, dtype=normals.dtype)
-        floor_alignment = torch.abs(torch.sum(normals_norm * up_vector, dim=-1))
-        floor_mask = floor_alignment > self.normal_threshold
+        floor_alignment = torch.abs(torch.sum(stable_normals * up_vector, dim=-1))
+        floor_mask_stable = floor_alignment > self.normal_threshold
         
-        # Detect walls (horizontal normals)
-        horizontal_alignment = torch.abs(normals_norm[:, 2])  # z-component
-        wall_mask = horizontal_alignment < (1 - self.normal_threshold)
+        # Detect walls (horizontal normals) - more conservative threshold  
+        horizontal_alignment = torch.abs(stable_normals[:, 2])  # z-component
+        wall_mask_stable = horizontal_alignment < (1 - self.normal_threshold)
         
-        # Find dominant wall directions
-        wall_normals = normals_norm[wall_mask]
-        if wall_mask.sum() > 10:
-            # Cluster wall normals
+        # Map back to original indices
+        stable_indices = torch.where(stable_mask)[0]
+        floor_mask = torch.zeros(n_rays, dtype=torch.bool, device=device)
+        wall_mask = torch.zeros(n_rays, dtype=torch.bool, device=device)
+        
+        if floor_mask_stable.sum() > 0:
+            floor_indices = stable_indices[floor_mask_stable]
+            floor_mask[floor_indices] = True
+            
+        if wall_mask_stable.sum() > 0:
+            wall_indices = stable_indices[wall_mask_stable]
+            wall_mask[wall_indices] = True
+        
+        # Find dominant wall directions (only if enough wall points)
+        wall_normals = stable_normals[wall_mask_stable]
+        if wall_mask_stable.sum() > 20:  # Increased threshold for stability
             wall_clusters = self._cluster_wall_normals(wall_normals)
         else:
             wall_clusters = {}
@@ -191,6 +226,7 @@ def manhattan_sdf_loss(normals: torch.Tensor, depth_map: torch.Tensor,
                       weight: float = 1.0) -> Tuple[torch.Tensor, Dict]:
     """
     ManhattanSDF-style loss with semantic plane constraints.
+    Much more conservative to prevent overfitting.
     
     Args:
         normals: Surface normals [N_rays, 3]
@@ -209,23 +245,27 @@ def manhattan_sdf_loss(normals: torch.Tensor, depth_map: torch.Tensor,
     loss_dict = {}
     total_loss = torch.tensor(0.0, device=device)
     
+    # Very conservative thresholds to prevent overfitting
+    min_points_floor = 50    # Increased from 5
+    min_points_wall = 30     # Increased from 5
+    
     # Floor normal constraint (should align with Manhattan up direction)
-    if semantic_info['n_floor'] > 5:
+    if semantic_info['n_floor'] > min_points_floor:
         floor_mask = semantic_info['floor_mask']
         floor_normals = normals_norm[floor_mask]
         
         # Expected floor normal in Manhattan frame
         manhattan_up = manhattan_frame[:, 2]  # Z-axis
         
-        # Cosine similarity loss
+        # Cosine similarity loss with clamping to prevent extreme values
         floor_alignment = torch.sum(floor_normals * manhattan_up, dim=-1)
-        floor_loss = torch.mean(1.0 - torch.abs(floor_alignment))
+        floor_loss = torch.mean(torch.clamp(1.0 - torch.abs(floor_alignment), 0.0, 1.0))
         
         loss_dict['floor'] = floor_loss
-        total_loss += floor_loss * 2.0  # Higher weight for floor
+        total_loss += floor_loss * 0.5  # Reduced weight from 2.0
     
     # Wall normal constraints (should align with Manhattan horizontal directions)
-    if semantic_info['n_wall'] > 5:
+    if semantic_info['n_wall'] > min_points_wall:
         wall_mask = semantic_info['wall_mask']
         wall_normals = normals_norm[wall_mask]
         
@@ -238,22 +278,26 @@ def manhattan_sdf_loss(normals: torch.Tensor, depth_map: torch.Tensor,
         align_y = torch.abs(torch.sum(wall_normals * manhattan_y, dim=-1))
         
         best_alignment = torch.maximum(align_x, align_y)
-        wall_loss = torch.mean(1.0 - best_alignment)
+        wall_loss = torch.mean(torch.clamp(1.0 - best_alignment, 0.0, 1.0))
         
         loss_dict['wall'] = wall_loss
-        total_loss += wall_loss
+        total_loss += wall_loss * 0.3  # Reduced weight from 1.0
     
-    # General Manhattan alignment for all normals (lower weight)
+    # General Manhattan alignment for all normals (much lower weight)
     manhattan_dirs = manhattan_frame  # 3x3 matrix
     all_alignments = torch.abs(torch.matmul(normals_norm, manhattan_dirs))  # [N, 3]
     best_alignments = torch.max(all_alignments, dim=-1)[0]  # [N]
     
-    # Only penalize normals that are somewhat confident
-    confidence_mask = best_alignments > 0.3  # Lower threshold than before
-    if confidence_mask.sum() > 0:
-        general_loss = torch.mean(1.0 - best_alignments[confidence_mask])
+    # Only penalize normals that are somewhat confident, with stricter threshold
+    confidence_mask = best_alignments > 0.5  # Increased from 0.3
+    if confidence_mask.sum() > 20:  # Need minimum confident predictions
+        confident_alignments = best_alignments[confidence_mask]
+        general_loss = torch.mean(torch.clamp(1.0 - confident_alignments, 0.0, 1.0))
         loss_dict['general'] = general_loss
-        total_loss += general_loss * 0.1  # Much lower weight
+        total_loss += general_loss * 0.02  # Much smaller weight from 0.1
+    
+    # Clamp total loss to prevent explosion
+    total_loss = torch.clamp(total_loss, 0.0, 0.1)
     
     return weight * total_loss, loss_dict
 
@@ -438,9 +482,9 @@ def combine_structural_losses_v2(depth_pred: torch.Tensor,
     
     # Initialize components if not provided
     if manhattan_frame_estimator is None:
-        manhattan_frame_estimator = ManhattanFrameEstimator()
+        manhattan_frame_estimator = ManhattanFrameEstimator(confidence_threshold=0.4)  # More conservative
     if semantic_detector is None:
-        semantic_detector = SemanticPlaneDetector()
+        semantic_detector = SemanticPlaneDetector(normal_threshold=0.5)  # More conservative
     
     # Detect semantic planes
     semantic_info = semantic_detector.detect_planes(depth_pred, normals, spatial_coords)

@@ -909,9 +909,9 @@ def train():
     psnr_list = []
     time_list = []
     
-    # Initialize structural priors components (V2)
-    manhattan_estimator = ManhattanFrameEstimator(confidence_threshold=0.6)
-    semantic_detector = SemanticPlaneDetector(normal_threshold=0.7)
+    # Initialize structural priors components (V2) with conservative parameters
+    manhattan_estimator = ManhattanFrameEstimator(confidence_threshold=0.4)  # More conservative
+    semantic_detector = SemanticPlaneDetector(normal_threshold=0.5)           # More conservative
     
     # PocketNeRF Time Tracking for Final Report
     time_metrics = {
