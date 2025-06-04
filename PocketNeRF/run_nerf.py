@@ -158,6 +158,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     rgbs = []
     depths = []
     psnrs = []
+    avg_psnr = None # Initialize avg_psnr
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
@@ -205,7 +206,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         with open(os.path.join(savedir, "test_psnrs_avg{:0.2f}.pkl".format(avg_psnr)), "wb") as fp:
             pickle.dump(psnrs, fp)
 
-    return rgbs, depths
+    return rgbs, depths, avg_psnr
 
 
 def create_nerf(args):
@@ -688,6 +689,12 @@ def config_parser():
     parser.add_argument("--structural_loss_start_iter", type=int, default=1000,
                         help='iteration to start applying structural losses')
     
+    # Add new args for overfitting control
+    parser.add_argument("--overfitting_psnr_gap_threshold", type=float, default=7.0,
+                        help='PSNR gap between train and test to trigger structural weight reduction for overfitting.')
+    parser.add_argument("--overfitting_reduction_factor", type=float, default=0.75,
+                        help='Factor to reduce structural weights by when overfitting is detected (e.g., 0.75 for 25% reduction).')
+    
     return parser
 
 
@@ -1025,20 +1032,30 @@ def train():
             
             # Dynamic weight adjustment to prevent overfitting
             # Reduce weights if training much better than recent test performance
-            if i > 2000 and i % 1000 == 0 and len(psnr_list) > 20:
-                # Check for overfitting pattern: training improving but test declining
-                recent_train_psnr = np.mean(psnr_list[-10:])
-                # Simple heuristic: if training PSNR is much higher than recent test performance
-                # and structural losses are high, reduce weights
-                if hasattr(args, '_last_test_psnr') and recent_train_psnr - args._last_test_psnr > 10:
-                    print(f"\n⚠️  Potential overfitting detected at iteration {i}")
-                    print(f"   Train PSNR: {recent_train_psnr:.1f} dB, Last Test: {args._last_test_psnr:.1f} dB")
-                    print(f"   Reducing structural prior weights by 50%")
-                    args.depth_prior_weight *= 0.5
-                    args.planarity_weight *= 0.5
-                    args.manhattan_weight *= 0.5
-                    args.normal_consistency_weight *= 0.5
-                    print(f"   New weights: depth={args.depth_prior_weight:.4f}, planarity={args.planarity_weight:.4f}")
+            if args.use_structural_priors and i > args.structural_loss_start_iter and \
+               i > 2000 and i % args.i_testset == 0 and \
+               hasattr(args, '_last_test_psnr') and args._last_test_psnr is not None:
+                
+                # Ensure psnr_list is not empty and has enough elements
+                if len(psnr_list) >= 10:
+                    recent_train_psnr = np.mean(psnr_list[-10:]) # psnr_list contains train PSNRs
+                    
+                    psnr_gap_threshold = getattr(args, 'overfitting_psnr_gap_threshold', 7.0)
+                    reduction_factor = getattr(args, 'overfitting_reduction_factor', 0.75)
+                    min_weight_cap = 0.0001 # Minimum weight to prevent full zeroing
+
+                    if recent_train_psnr - args._last_test_psnr > psnr_gap_threshold:
+                        print(f"\n⚠️  Potential overfitting detected at iteration {i}")
+                        print(f"   Train PSNR (avg last 10): {recent_train_psnr:.2f} dB, Last Actual Test PSNR: {args._last_test_psnr:.2f} dB")
+                        print(f"   PSNR Gap: {recent_train_psnr - args._last_test_psnr:.2f} dB (Threshold: {psnr_gap_threshold:.1f} dB)")
+                        print(f"   Reducing structural prior weights by factor {reduction_factor}")
+                        
+                        args.depth_prior_weight = max(args.depth_prior_weight * reduction_factor, min_weight_cap)
+                        args.planarity_weight = max(args.planarity_weight * reduction_factor, min_weight_cap)
+                        args.manhattan_weight = max(args.manhattan_weight * reduction_factor, min_weight_cap)
+                        args.normal_consistency_weight = max(args.normal_consistency_weight * reduction_factor, min_weight_cap)
+                        
+                        print(f"   New weights: depth={args.depth_prior_weight:.4f}, planarity={args.planarity_weight:.4f}, manhattan={args.manhattan_weight:.4f}, normal_consistency={args.normal_consistency_weight:.4f}")
             
             # Prepare structural prior weights
             structural_weights = {
@@ -1184,9 +1201,13 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                _, _, avg_test_psnr = render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
             
+            if avg_test_psnr is not None:
+                args._last_test_psnr = avg_test_psnr
+                print(f"  📈 Updated args._last_test_psnr to: {args._last_test_psnr:.2f} dB")
+
             # Additional PocketNeRF evaluation logging
             if args.use_structural_priors and i >= args.structural_loss_start_iter:
                 print(f"📊 PocketNeRF Status @ {i}:")
@@ -1201,12 +1222,6 @@ def train():
                         status = "📈 Improving" if improvement > 0.5 else "📉 Declining" if improvement < -0.5 else "➡️ Stable"
                         print(f"   PSNR vs pre-structural: {improvement:+.2f} dB ({status})")
             
-            # Store last test PSNR for overfitting detection (rough estimate from test renders)
-            if i >= 1000:  # Start tracking after structural priors activate
-                # Rough estimate: test PSNR is typically lower than train, use a heuristic
-                estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Observed ~12dB gap
-                args._last_test_psnr = max(10.0, estimated_test_psnr)  # Floor at 10dB
-
         if i%args.i_print==0:
             # Enhanced logging for PocketNeRF monitoring
             base_msg = f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.2f}"

@@ -93,7 +93,7 @@ def planarity_loss(points: torch.Tensor, normals: torch.Tensor,
             # Fit plane: compute normal vector
             v1 = plane_points[1] - plane_points[0]
             v2 = plane_points[2] - plane_points[0]
-            normal = torch.cross(v1, v2)
+            normal = torch.linalg.cross(v1, v2)
             normal_norm = torch.norm(normal)
             
             if normal_norm > 1e-6:
