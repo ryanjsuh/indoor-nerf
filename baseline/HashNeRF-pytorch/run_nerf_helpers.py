@@ -206,13 +206,32 @@ class NeRFSmall(nn.Module):
 
         #Add quantizers for activations
         if use_quantization:
-            #Quantizers for sigma network acts
+            # # Quantizers for sigma network acts
+
+            # # uncomment for fixed quant
+            # self.sigma_act_quantizers = nn.ModuleList([
+            #     FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+            #     for i in range(num_layers - 1)
+            # ])
+            # #quantizer for sigma network weights (only gonna do first layer for now)
+            # self.sigma_weight_quantizer = FakeQuantizer(num_bits=quantization_bits, symmetric=True)
+
+            # Quant for activations
             self.sigma_act_quantizers = nn.ModuleList([
-                FakeQuantizer(num_bits=quantization_bits, symmetric=False)
-                for i in range(num_layers - 1)
+                LearnedBitwidthQuantizer(init_bits=float(quantization_bits),
+                                       min_bits=2.0,
+                                       max_bits=32.0,
+                                       symmetric=False)
+                for _ in range(num_layers - 1)
             ])
-            #quantizer for sigma network weights (only gonna do first layer for now)
-            self.sigma_weight_quantizer = FakeQuantizer(num_bits=quantization_bits, symmetric=True)
+            # Quantizer for sigma network weights
+            self.sigma_weight_quantizer = LearnedBitwidthQuantizer(
+                init_bits=float(quantization_bits),
+                min_bits=2.0,
+                max_bits=32.0,
+                symmetric=True  # Weights are typically symmetric
+            )
+
         else:
             self.sigma_act_quantizers = None
             self.sigma_weight_quantizer = None

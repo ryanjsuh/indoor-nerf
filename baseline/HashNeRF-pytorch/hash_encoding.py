@@ -33,8 +33,18 @@ class HashEmbedder(nn.Module):
         
         #Add quantizing for each level if True
         if use_quantization:
+            # Uncomment to use FakeQuantizer for reference
+            # self.quantizers = nn.ModuleList([
+            #     FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+            #     for i in range(n_levels)
+            # ])
+
+            # Actual quant coded
             self.quantizers = nn.ModuleList([
-                FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+                LearnedBitwidthQuantizer(init_bits=float(quantization_bits), 
+                                       min_bits=2.0, 
+                                       max_bits=32.0, 
+                                       symmetric=False)
                 for i in range(n_levels)
             ])
         else:

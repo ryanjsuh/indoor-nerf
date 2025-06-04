@@ -335,6 +335,61 @@ def create_nerf(args):
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
+# Function for A-CAQ Loss
+def compute_acaq_loss(mse_loss, model, embed_fn, target_metric=None, bit_penalty=1e-3):
+    """
+    Compute A-CAQ loss following Eq. 8 from the paper.
+    
+    Args:
+        mse_loss: Current MSE loss (L^NeRF)
+        model: NeRF model
+        embed_fn: Hash embedding function
+        target_metric: Target MSE (L^metric), if None uses current loss
+        bit_penalty: Weight for bitwidth penalty
+    
+    Returns:
+        bit_loss: Loss for bitwidth optimization
+        avg_bits: Average bitwidth for logging
+    """
+    # Collect all quantizers and their bitwidths
+    bitwidths = []
+    
+    # Get bitwidths from hash embeddings
+    if hasattr(embed_fn, 'quantizers') and embed_fn.quantizers is not None:
+        for q in embed_fn.quantizers:
+            bitwidths.append(q.bit_width)
+    
+    # Get bitwidths from model
+    if hasattr(model, 'sigma_act_quantizers') and model.sigma_act_quantizers is not None:
+        for q in model.sigma_act_quantizers:
+            bitwidths.append(q.bit_width)
+    if hasattr(model, 'sigma_weight_quantizer') and model.sigma_weight_quantizer is not None:
+        bitwidths.append(model.sigma_weight_quantizer.bit_width)
+    
+    if len(bitwidths) == 0:
+        return torch.tensor(0.0), 32.0  # No quantization
+    
+    # Stack all bitwidths
+    bitwidths = torch.stack(bitwidths)
+    
+    # Compute average bitwidth for logging
+    avg_bits = bitwidths.mean().item()
+    
+    # If no target metric specified, use current loss (MDL mode)
+    if target_metric is None:
+        target_metric = mse_loss.detach()  # Detach to avoid gradients
+    
+    # Compute bit loss (Eq. 8 from paper)
+    # First term: sqrt(||L^NeRF - L^metric||)
+    accuracy_term = torch.sqrt(torch.abs(mse_loss - target_metric) + 1e-8)
+    
+    # Second term: sum of bitwidths with penalty
+    bitwidth_term = bit_penalty * bitwidths.sum()
+    
+    bit_loss = accuracy_term + bitwidth_term
+    
+    return bit_loss, avg_bits
+
 #Function for quant info
 def print_model_info(model, embed_fn, name="Model"):
     """Print model size and quantization info"""
@@ -681,6 +736,17 @@ def config_parser():
     parser.add_argument("--quantization_bits", type=int, default=8,
                         help='number of bits for quantization (default: 8)')
     
+    # A-CAQ specific arguments
+    parser.add_argument("--use_acaq", action='store_true',
+                        help='enable content-aware quantization (A-CAQ)')
+    parser.add_argument("--target_metric", type=float, default=None,
+                        help='target MSE for MGL mode (None for MDL mode)')
+    parser.add_argument("--bit_penalty", type=float, default=1e-3,
+                        help='penalty weight for bitwidth')
+    parser.add_argument("--acaq_start_iter", type=int, default=1000,
+                        help='iteration to start A-CAQ training')
+
+
     return parser
 
 
@@ -976,6 +1042,50 @@ def train():
         # pdb.set_trace()
         optimizer.step()
 
+        # ADD A-CAQ TRAINING HERE
+        # A-CAQ Training
+        if args.use_acaq and args.use_quantization and i >= args.acaq_start_iter:
+            # Collect all quantizers
+            quantizers = []
+            if hasattr(render_kwargs_train["embed_fn"], 'quantizers') and render_kwargs_train["embed_fn"].quantizers is not None:
+                quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+            if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers') and render_kwargs_train["network_fn"].sigma_act_quantizers is not None:
+                quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
+            if hasattr(render_kwargs_train["network_fn"], 'sigma_weight_quantizer') and render_kwargs_train["network_fn"].sigma_weight_quantizer is not None:
+                quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
+            
+            if quantizers:  # Only if we have quantizers with learnable bitwidths
+                # Collect bitwidths
+                bitwidths = []
+                for q in quantizers:
+                    if hasattr(q, 'bit_width'):  # LearnedBitwidthQuantizer
+                        bitwidths.append(q.bit_width)
+                
+                if bitwidths:
+                    bitwidths = torch.stack(bitwidths)
+                    avg_bits = bitwidths.mean().item()
+                    
+                    # Compute A-CAQ loss (Eq. 8 from paper)
+                    target_metric = args.target_metric if args.target_metric is not None else img_loss.detach()
+                    accuracy_term = torch.sqrt(torch.abs(img_loss - target_metric) + 1e-8)
+                    bitwidth_term = args.bit_penalty * bitwidths.sum()
+                    bit_loss = accuracy_term + bitwidth_term
+                    
+                    # Optimize bitwidths only
+                    optimizer.zero_grad()
+                    bit_loss.backward()
+                    
+                    # Manual gradient update for bitwidth parameters only
+                    with torch.no_grad():
+                        for q in quantizers:
+                            if hasattr(q, 'soft_bits') and q.soft_bits.grad is not None:
+                                q.soft_bits.data -= new_lrate * q.soft_bits.grad
+                    
+                    # Log every i_print iterations
+                    if i % args.i_print == 0:
+                        tqdm.write(f"[A-CAQ] Bit loss: {bit_loss.item():.4f}, Avg bits: {avg_bits:.2f}")
+
+
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -1052,7 +1162,7 @@ def train():
                 
                 avg_bits = calculate_fqr(quantizers)
                 tqdm.write(f"[QUANT] Average bits: {avg_bits:.2f}, Num quantizers: {len(quantizers)}")
-            #END QUANT LOGGING
+            #END quant logging
 
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
