@@ -925,8 +925,7 @@ def train():
             if i>1000:
                 args.tv_loss_weight = 0.0
 
-        loss.backward(retain_graph=True)
-        # pdb.set_trace()
+        loss.backward()
         optimizer.step()
 
         # A-CAQ Training (Adversarial Content-Aware Quantization)
@@ -951,26 +950,33 @@ def train():
                     bitwidths = torch.stack(bitwidths)
                     avg_bits = bitwidths.mean().item()
                     
-                    # Compute A-CAQ loss (Eq. 8 from paper)
-                    target_metric = args.target_metric if args.target_metric is not None else img_loss.detach()
-                    accuracy_term = torch.sqrt(torch.abs(img_loss - target_metric) + 1e-8)
-                    bitwidth_term = args.bit_penalty * bitwidths.sum()
-                    bit_loss = accuracy_term + bitwidth_term
-                    
-                    # Optimize bitwidths only
-                    optimizer.zero_grad()
-                    bit_loss.backward()
-                    
-                    # Manual gradient update for bitwidth parameters only
-                    with torch.no_grad():
-                        for q in quantizers:
-                            if hasattr(q, 'soft_bits') and q.soft_bits.grad is not None:
-                                q.soft_bits.data -= new_lrate * q.soft_bits.grad
+                    # Update bitwidths every 10 iterations
+                    if i % 10 == 0:
+                        target_metric = args.target_metric if args.target_metric is not None else 0.001
+                        
+                        with torch.no_grad():
+                            for q in quantizers:
+                                if hasattr(q, 'soft_bits'):
+                                    if img_loss < target_metric:
+                                        # Loss is good, can reduce bits
+                                        q.soft_bits.data -= 0.1
+                                    else:
+                                        # Loss is bad, might need more bits
+                                        q.soft_bits.data += 0.05
+                                    
+                                    q.soft_bits.data = torch.clamp(q.soft_bits.data, q.min_bits, q.max_bits)
                     
                     # Log every i_print iterations
                     if i % args.i_print == 0:
-                        tqdm.write(f"[A-CAQ] Bit loss: {bit_loss.item():.4f}, Avg bits: {avg_bits:.2f}")
-
+                        # Log current bitwidths for each quantizer
+                        bit_info = []
+                        for idx, q in enumerate(quantizers):
+                            if hasattr(q, 'soft_bits'):
+                                bit_info.append(f"Q{idx}: {q.soft_bits.item():.2f}")
+                        
+                        tqdm.write(f"[A-CAQ] Avg bits: {avg_bits:.2f} | Target: {args.target_metric} | Current loss: {img_loss.item():.4f}")
+                        if bit_info:
+                            tqdm.write(f"[BITS] {' | '.join(bit_info)}")
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
