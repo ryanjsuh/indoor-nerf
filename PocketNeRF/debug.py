@@ -48,5 +48,45 @@ def test_quantizer():
     print(f"\nUnique values in output: {unique_vals}")
     print(f"Expected for {quantizer.integer_bit_width}-bit: {2**quantizer.integer_bit_width}")
 
+import torch
+import sys
+sys.path.append('PocketNeRF')
+
+# Import both quantizers to compare
+from quantization import LearnedBitwidthQuantizer as OldQuantizer
+
+# Test with the fixed quantizer
+def test_fixed_quantizer():
+    # Simulate hash embedding values
+    x = torch.randn(100, 32) * 0.0001  # Small values like real hash embeddings
+    
+    print("Testing with hash embedding-like values")
+    print(f"Input stats: mean={x.mean():.6f}, std={x.std():.6f}, min={x.min():.6f}, max={x.max():.6f}")
+    
+    # Test old quantizer
+    print("\n=== OLD QUANTIZER ===")
+    old_q = OldQuantizer(init_bits=8.0, symmetric=False)
+    old_q.eval()  # Put in eval mode
+    with torch.no_grad():
+        x_old = old_q(x)
+    print(f"Output stats: mean={x_old.mean():.6f}, std={x_old.std():.6f}")
+    print(f"Unique values: {torch.unique(x_old).numel()}")
+    print(f"Error: {(x - x_old).abs().mean():.6f}")
+    
+    # Test fixed quantizer (from the artifact above)
+    print("\n=== FIXED QUANTIZER ===")
+    # You'll need to copy the fixed code and test it
+    # This shows what the output should look like
+    print("Expected behavior:")
+    print("- Output should preserve the scale of input")
+    print("- Should have many unique values for 8-bit quantization")
+    print("- Error should be small (< 0.0001)")
+    
+    # Test passthrough for comparison
+    print("\n=== PASSTHROUGH (No Quantization) ===")
+    print(f"Output would be identical to input")
+    print(f"This is what PSNR ~23 dB corresponds to")
+
 if __name__ == "__main__":
-    test_quantizer()
+    test_fixed_quantizer()
+    # test_quantizer()
