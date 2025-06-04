@@ -1,3 +1,9 @@
+"""
+Structural Priors for PocketNeRF
+Implementation of planarity constraints and Manhattan-world assumptions for indoor scene reconstruction.
+Based on the research described in the PocketNeRF milestone document.
+"""
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -7,261 +13,286 @@ from typing import Optional, Tuple, List
 def depth_prior_loss(depth_pred: torch.Tensor, depth_prior: torch.Tensor, 
                     weight: float = 1.0, use_ranking: bool = True) -> torch.Tensor:
     """
-    Depth prior loss with stronger regularization for few-shot scenarios.
+    Depth prior loss as described in the research preview.
+    
+    Args:
+        depth_pred: Predicted depth values [N_rays]
+        depth_prior: Prior depth estimates [N_rays] 
+        weight: Loss weight
+        use_ranking: Whether to use ranking loss instead of MSE
+    
+    Returns:
+        Depth prior loss
     """
     if use_ranking:
-        # Increase number of pairs for better coverage
-        n_pairs = min(5000, depth_pred.shape[0] * 10)  # Much more pairs
+        # Use ranking loss to enforce relative depth ordering
+        # Sample pairs of pixels and enforce depth ordering
+        n_pairs = min(1000, depth_pred.shape[0] // 2)
         if n_pairs > 0:
-            idx1 = torch.randint(0, depth_pred.shape[0], (n_pairs,), device=depth_pred.device)
-            idx2 = torch.randint(0, depth_pred.shape[0], (n_pairs,), device=depth_pred.device)
+            idx1 = torch.randint(0, depth_pred.shape[0], (n_pairs,))
+            idx2 = torch.randint(0, depth_pred.shape[0], (n_pairs,))
             
-            # Only compare pairs that are spatially close (more relevant comparisons)
-            valid_pairs = (idx1 - idx2).abs() < depth_pred.shape[0] // 4
-            idx1 = idx1[valid_pairs]
-            idx2 = idx2[valid_pairs]
+            # Get depth differences
+            depth_diff_pred = depth_pred[idx1] - depth_pred[idx2]
+            depth_diff_prior = depth_prior[idx1] - depth_prior[idx2]
             
-            if len(idx1) > 0:
-                depth_diff_pred = depth_pred[idx1] - depth_pred[idx2]
-                depth_diff_prior = depth_prior[idx1] - depth_prior[idx2]
-                
-                # Stronger hinge loss with margin
-                margin = 0.1
-                loss = F.relu(margin - depth_diff_pred * depth_diff_prior.sign()).mean()
-                return weight * loss
+            # Hinge loss to enforce same ordering
+            loss = F.relu(-depth_diff_pred * depth_diff_prior.sign()).mean()
+            return weight * loss
     else:
-        # Robust loss function to handle outliers better
-        depth_pred_norm = (depth_pred - depth_pred.median()) / (depth_pred.std() + 1e-8)
-        depth_prior_norm = (depth_prior - depth_prior.median()) / (depth_prior.std() + 1e-8)
-        
-        # Huber loss is more robust to outliers than MSE
-        return weight * F.smooth_l1_loss(depth_pred_norm, depth_prior_norm)
+        # Simple MSE loss (normalize depths first)
+        depth_pred_norm = (depth_pred - depth_pred.mean()) / (depth_pred.std() + 1e-8)
+        depth_prior_norm = (depth_prior - depth_prior.mean()) / (depth_prior.std() + 1e-8)
+        return weight * F.mse_loss(depth_pred_norm, depth_prior_norm)
     
     return torch.tensor(0.0, device=depth_pred.device)
 
 
-def planarity_loss(points: torch.Tensor, normals: torch.Tensor, 
-                  depth_map: torch.Tensor, rays_d: torch.Tensor,
-                  weight: float = 1.0, plane_threshold: float = 0.05,
-                  smoothness_weight: float = 0.5) -> torch.Tensor:
+def planarity_loss_improved(depth_map: torch.Tensor, rays_d: torch.Tensor,
+                          weight: float = 1.0, patch_size: int = 8, 
+                          depth_threshold: float = 0.05, min_patch_size: int = 4) -> torch.Tensor:
     """
-    Stronger planarity constraints with depth smoothness and normal alignment.
+    Improved planarity constraints using local depth consistency instead of random sampling.
+    This reduces overfitting by providing more stable, spatially-coherent constraints.
+    
+    Args:
+        depth_map: Rendered depth map [N_rays]
+        rays_d: Ray directions [N_rays, 3]
+        weight: Loss weight
+        patch_size: Size of local patches to analyze
+        depth_threshold: Threshold for depth variation within patches
+        min_patch_size: Minimum number of rays needed for patch analysis
+        
+    Returns:
+        Planarity loss
     """
-    device = points.device
+    device = depth_map.device
     N_rays = depth_map.shape[0]
     
-    if N_rays < 3:
+    if N_rays < min_patch_size:
         return torch.tensor(0.0, device=device)
     
-    # Convert depth map to 3D points on surface
-    surface_points = rays_d * depth_map.unsqueeze(-1)
+    # For few-shot training, use simpler local smoothness instead of complex plane fitting
+    # This is more stable and generalizes better
     
-    total_loss = torch.tensor(0.0, device=device)
-    
-    # 1. Local planarity constraint - check small neighborhoods
-    patch_size = int(np.sqrt(N_rays))
-    if patch_size > 10:  # Only if we have enough rays
-        # Reshape to approximate image grid
-        try:
-            depth_grid = depth_map[:patch_size**2].view(patch_size, patch_size)
-            
-            # Compute local depth variance in small windows
-            kernel_size = 3
-            unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=1, padding=1)
-            patches = unfold(depth_grid.unsqueeze(0).unsqueeze(0))  # [1, k*k, n_patches]
-            
-            # Penalize high variance in local patches
-            patch_vars = patches.var(dim=1)
-            planarity_loss = patch_vars.mean()
-            total_loss += weight * 2.0 * planarity_loss  # Stronger weight
-        except:
-            pass
-    
-    # 2. Global plane fitting with RANSAC-style approach
-    n_trials = min(100, N_rays // 10)
-    plane_losses = []
-    
-    for _ in range(n_trials):
-        if N_rays >= 3:
-            indices = torch.randperm(N_rays, device=device)[:3]
-            plane_points = surface_points[indices]
-            
-            # Fit plane
-            v1 = plane_points[1] - plane_points[0]
-            v2 = plane_points[2] - plane_points[0]
-            normal = torch.linalg.cross(v1, v2)
-            normal_norm = torch.norm(normal)
-            
-            if normal_norm > 1e-6:
-                normal = normal / normal_norm
-                plane_origin = plane_points[0]
-                
-                # Compute distances to plane
-                distances = torch.abs(torch.sum((surface_points - plane_origin) * normal, dim=-1))
-                
-                # Adaptive threshold based on scene scale
-                adaptive_threshold = plane_threshold * depth_map.mean()
-                on_plane_mask = distances < adaptive_threshold
-                n_on_plane = torch.sum(on_plane_mask)
-                
-                # If enough points are coplanar, this might be a real plane
-                if n_on_plane >= N_rays * 0.1:  # At least 10% of points
-                    # Strong penalty for deviations
-                    plane_loss = distances[on_plane_mask].mean()
-                    plane_losses.append(plane_loss)
-                    
-                    # Also encourage normal consistency if we have normals
-                    if normals is not None and normals.shape[0] == N_rays:
-                        normal_alignment = 1.0 - torch.abs(torch.sum(normals[on_plane_mask] * normal, dim=-1)).mean()
-                        total_loss += weight * 0.5 * normal_alignment
-    
-    if plane_losses:
-        # Use the best plane (lowest loss) as strong guidance
-        best_plane_loss = torch.stack(plane_losses).min()
-        total_loss += weight * 3.0 * best_plane_loss
-    
-    # 3. Depth smoothness with edge-aware weighting
-    n_neighbors = min(1000, N_rays)
-    if n_neighbors > 0:
-        idx1 = torch.randint(0, N_rays, (n_neighbors,), device=device)
-        idx2 = torch.randint(0, N_rays, (n_neighbors,), device=device)
+    # Method 1: Local depth smoothness with edge preservation
+    n_pairs = min(500, N_rays // 4)  # Reduced from previous implementation
+    if n_pairs > 0:
+        # Sample neighboring rays (more likely to be spatially related)
+        idx1 = torch.randint(0, N_rays-1, (n_pairs,), device=device)
+        idx2 = idx1 + 1  # Adjacent rays instead of completely random
         
-        # Spatial distance weight (closer pixels should have similar depth)
-        ray_similarity = F.cosine_similarity(rays_d[idx1], rays_d[idx2], dim=-1).abs()
+        depth1 = depth_map[idx1]
+        depth2 = depth_map[idx2]
         
-        # Depth difference weighted by spatial proximity
-        depth_diff = torch.abs(depth_map[idx1] - depth_map[idx2])
-        weighted_diff = depth_diff * ray_similarity
+        # Edge-preserving smoothness: smaller penalty for large depth differences
+        # This allows for depth discontinuities while encouraging smoothness
+        depth_diff = torch.abs(depth1 - depth2)
+        smoothness_loss = torch.mean(torch.exp(-depth_diff / depth_threshold) * depth_diff)
         
-        # Total variation regularization
-        tv_loss = weighted_diff.mean()
-        total_loss += smoothness_weight * tv_loss
+        return weight * smoothness_loss
+    
+    return torch.tensor(0.0, device=device)
+
+
+def planarity_loss(points: torch.Tensor, normals: torch.Tensor, 
+                  depth_map: torch.Tensor, rays_d: torch.Tensor,
+                  weight: float = 1.0, plane_threshold: float = 0.1,
+                  smoothness_weight: float = 0.1) -> torch.Tensor:
+    """
+    DEPRECATED: Using improved planarity loss instead.
+    Kept for compatibility but redirects to improved version.
+    """
+    return planarity_loss_improved(depth_map, rays_d, weight, 
+                                 depth_threshold=plane_threshold)
+
+
+def manhattan_world_loss_adaptive(normals: torch.Tensor, depth_map: torch.Tensor,
+                                weight: float = 1.0, confidence_threshold: float = 0.7,
+                                adaptive_threshold: float = 0.8) -> torch.Tensor:
+    """
+    Adaptive Manhattan-world assumption that only applies to surfaces that actually appear axis-aligned.
+    This reduces overfitting by not forcing non-Manhattan surfaces to be axis-aligned.
+    
+    Args:
+        normals: Surface normals [N_rays, 3]
+        depth_map: Depth values for confidence weighting [N_rays]
+        weight: Loss weight
+        confidence_threshold: Minimum alignment confidence to apply constraint
+        adaptive_threshold: Threshold for considering a normal axis-aligned
         
-    return total_loss
+    Returns:
+        Adaptive Manhattan world loss
+    """
+    if normals.dim() == 3:
+        normals = normals[:, -1, :]  # [N_rays, 3]
+    
+    device = normals.device
+    
+    # Define canonical Manhattan directions
+    manhattan_dirs = torch.tensor([
+        [1.0, 0.0, 0.0],  # X-axis
+        [0.0, 1.0, 0.0],  # Y-axis  
+        [0.0, 0.0, 1.0],  # Z-axis
+    ], device=device, dtype=normals.dtype)
+    
+    # Normalize normals
+    normals_norm = F.normalize(normals, dim=-1)
+    
+    # Compute alignment with each Manhattan direction
+    alignments = torch.abs(torch.matmul(normals_norm, manhattan_dirs.T))  # [N_rays, 3]
+    best_alignment, best_idx = torch.max(alignments, dim=-1)  # [N_rays]
+    
+    # Only apply Manhattan constraint to normals that are already somewhat aligned
+    # This prevents forcing curved or diagonal surfaces to be axis-aligned
+    confident_mask = best_alignment > adaptive_threshold
+    
+    if torch.sum(confident_mask) == 0:
+        return torch.tensor(0.0, device=device)
+    
+    # Apply loss only to confident predictions
+    confident_alignments = best_alignment[confident_mask]
+    manhattan_loss = (1.0 - confident_alignments).mean()
+    
+    # Weight by number of confident predictions to avoid over-penalizing
+    confidence_ratio = torch.sum(confident_mask).float() / normals.shape[0]
+    
+    return weight * manhattan_loss * confidence_ratio
 
 
 def manhattan_world_loss(normals: torch.Tensor, weight: float = 1.0,
                         confidence_threshold: float = 0.5) -> torch.Tensor:
     """
-    Stronger Manhattan-world assumption with adaptive axis detection.
+    DEPRECATED: Using adaptive Manhattan world loss instead.
+    Kept for compatibility but redirects to adaptive version.
     """
     if normals.dim() == 3:
         normals = normals[:, -1, :]
     
-    device = normals.device
+    # Use adaptive version with depth map as None (will use equal weighting)
+    depth_dummy = torch.ones(normals.shape[0], device=normals.device)
+    return manhattan_world_loss_adaptive(normals, depth_dummy, weight)
+
+
+def normal_consistency_loss_improved(normals_pred: torch.Tensor, 
+                                   depth_map: torch.Tensor,
+                                   weight: float = 1.0,
+                                   spatial_weight: float = 0.5) -> torch.Tensor:
+    """
+    Improved normal consistency that uses depth-based confidence weighting.
     
-    # Ensure normals are valid
-    normal_norms = torch.norm(normals, dim=-1)
-    valid_mask = normal_norms > 1e-6
-    if not valid_mask.any():
+    Args:
+        normals_pred: Predicted normals [N_rays, 3]
+        depth_map: Depth values for confidence weighting [N_rays]
+        weight: Loss weight
+        spatial_weight: Weight for spatial consistency vs random consistency
+        
+    Returns:
+        Improved normal consistency loss
+    """
+    device = normals_pred.device
+    N_rays = normals_pred.shape[0]
+    
+    if N_rays <= 1:
         return torch.tensor(0.0, device=device)
     
-    valid_normals = normals[valid_mask]
-    valid_normals = F.normalize(valid_normals, dim=-1)
+    # Normalize normals
+    normals_norm = F.normalize(normals_pred, dim=-1)
     
-    # Define canonical Manhattan directions
-    manhattan_dirs = torch.tensor([
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ], device=device, dtype=normals.dtype)
+    # Method 1: Spatially local consistency (adjacent rays)
+    spatial_loss = torch.tensor(0.0, device=device)
+    if N_rays > 1:
+        n_spatial = min(100, N_rays - 1)
+        idx1 = torch.randint(0, N_rays-1, (n_spatial,), device=device)
+        idx2 = idx1 + 1  # Adjacent rays
+        
+        normal1 = normals_norm[idx1]
+        normal2 = normals_norm[idx2]
+        
+        # Weight by depth similarity (nearby depths should have similar normals)
+        depth1 = depth_map[idx1]
+        depth2 = depth_map[idx2]
+        depth_similarity = torch.exp(-torch.abs(depth1 - depth2))
+        
+        cosine_sim = torch.sum(normal1 * normal2, dim=-1)
+        spatial_loss = torch.mean(depth_similarity * (1.0 - cosine_sim))
     
-    # Compute alignment with each Manhattan direction
-    alignments = torch.abs(torch.matmul(valid_normals, manhattan_dirs.T))
+    # Method 2: Random consistency (reduced weight)
+    random_loss = torch.tensor(0.0, device=device)
+    if N_rays > 1:
+        n_random = min(50, N_rays // 2)  # Reduced from original
+        idx1 = torch.randint(0, N_rays, (n_random,), device=device)
+        idx2 = torch.randint(0, N_rays, (n_random,), device=device)
+        
+        normal1 = normals_norm[idx1]
+        normal2 = normals_norm[idx2]
+        
+        cosine_sim = torch.sum(normal1 * normal2, dim=-1)
+        random_loss = (1.0 - cosine_sim).mean()
     
-    # For each normal, find the best Manhattan direction
-    best_alignment, best_idx = torch.max(alignments, dim=-1)
-    
-    # Stronger penalty for deviation from perfect alignment
-    # Use squared loss for stronger gradient when far from Manhattan
-    manhattan_loss = torch.pow(1.0 - best_alignment, 2).mean()
-    
-    # Additional loss to encourage diversity of Manhattan directions
-    # (prevent all normals from aligning to same axis)
-    if len(valid_normals) > 10:
-        direction_counts = torch.bincount(best_idx, minlength=3).float()
-        direction_probs = direction_counts / direction_counts.sum()
-        # Entropy regularization
-        entropy = -(direction_probs * torch.log(direction_probs + 1e-8)).sum()
-        diversity_loss = torch.relu(1.5 - entropy)  # Encourage entropy > 1.5
-        manhattan_loss += 0.1 * diversity_loss
-    
-    return weight * manhattan_loss
+    total_loss = spatial_weight * spatial_loss + (1.0 - spatial_weight) * random_loss
+    return weight * total_loss
 
 
 def normal_consistency_loss(normals_pred: torch.Tensor, normals_prior: Optional[torch.Tensor] = None,
-                          weight: float = 1.0, spatial_weight: float = 2.0) -> torch.Tensor:
+                          weight: float = 1.0) -> torch.Tensor:
     """
-    Stronger normal consistency with spatial coherence.
+    DEPRECATED: Using improved normal consistency loss instead.
+    Kept for compatibility but redirects to improved version.
     """
-    device = normals_pred.device
-    
     if normals_prior is not None:
+        # Use original implementation for prior-based consistency
+        device = normals_pred.device
         normals_pred_norm = F.normalize(normals_pred, dim=-1)
         normals_prior_norm = F.normalize(normals_prior, dim=-1)
         
-        # Angular loss (more sensitive than cosine similarity)
-        dot_product = torch.sum(normals_pred_norm * normals_prior_norm, dim=-1).clamp(-1, 1)
-        angle_loss = torch.acos(dot_product).mean()
+        cosine_sim = torch.sum(normals_pred_norm * normals_prior_norm, dim=-1)
+        consistency_loss = (1.0 - cosine_sim).mean()
         
-        return weight * angle_loss
-    
-    # Spatial smoothness for neighboring normals
-    N_rays = normals_pred.shape[0]
-    if N_rays > 1:
-        # Sample many more pairs for better coverage
-        n_pairs = min(2000, N_rays * 5)
-        if n_pairs > 0:
-            idx1 = torch.randint(0, N_rays, (n_pairs,), device=device)
-            idx2 = torch.randint(0, N_rays, (n_pairs,), device=device)
-            
-            # Only compare nearby normals (spatial coherence)
-            spatial_dist = (idx1 - idx2).abs().float() / N_rays
-            spatial_weight_mask = torch.exp(-spatial_dist * 10.0)  # Exponential decay
-            
-            normal1 = F.normalize(normals_pred[idx1], dim=-1)
-            normal2 = F.normalize(normals_pred[idx2], dim=-1)
-            
-            # Angular difference weighted by spatial proximity
-            dot_product = torch.sum(normal1 * normal2, dim=-1).clamp(-1, 1)
-            angle_diff = torch.acos(dot_product)
-            weighted_angle_diff = angle_diff * spatial_weight_mask
-            
-            smoothness_loss = weighted_angle_diff.mean()
-            
-            return weight * spatial_weight * smoothness_loss
-    
-    return torch.tensor(0.0, device=device)
+        return weight * consistency_loss
+    else:
+        # Use improved version with depth-based weighting (dummy depth)
+        depth_dummy = torch.ones(normals_pred.shape[0], device=normals_pred.device)
+        return normal_consistency_loss_improved(normals_pred, depth_dummy, weight)
 
 
-def edge_aware_smoothness_loss(depth_map: torch.Tensor, rgb_map: torch.Tensor, 
-                              weight: float = 1.0) -> torch.Tensor:
+def detect_planar_regions(depth_map: torch.Tensor, height: int, width: int,
+                         patch_size: int = 8, plane_threshold: float = 0.05) -> torch.Tensor:
     """
-    Edge-aware depth smoothness loss.
-    Encourages smooth depth except at color edges.
+    Simple plane detection using depth map patches.
+    
+    Args:
+        depth_map: Rendered depth map [N_rays]
+        height: Image height
+        width: Image width  
+        patch_size: Size of patches for plane detection
+        plane_threshold: Threshold for planarity
+        
+    Returns:
+        Binary mask indicating planar regions [N_rays]
     """
     device = depth_map.device
-    N_rays = depth_map.shape[0]
     
-    if N_rays < 4:
-        return torch.tensor(0.0, device=device)
+    # Reshape depth map to image
+    if depth_map.shape[0] == height * width:
+        depth_img = depth_map.view(height, width)
+    else:
+        # Handle random ray sampling - return all zeros
+        return torch.zeros_like(depth_map, dtype=torch.bool, device=device)
     
-    # Sample neighboring pairs
-    n_pairs = min(1000, N_rays)
-    idx1 = torch.randint(0, N_rays, (n_pairs,), device=device)
-    idx2 = torch.randint(0, N_rays, (n_pairs,), device=device)
+    planar_mask = torch.zeros_like(depth_img, dtype=torch.bool, device=device)
     
-    # Compute RGB difference (edge strength)
-    rgb_diff = torch.norm(rgb_map[idx1] - rgb_map[idx2], dim=-1)
-    edge_weight = torch.exp(-rgb_diff * 10.0)  # Low weight where color changes
+    # Check each patch
+    for i in range(0, height - patch_size + 1, patch_size // 2):
+        for j in range(0, width - patch_size + 1, patch_size // 2):
+            patch = depth_img[i:i+patch_size, j:j+patch_size]
+            
+            # Check if patch is approximately planar
+            patch_var = torch.var(patch)
+            if patch_var < plane_threshold:
+                planar_mask[i:i+patch_size, j:j+patch_size] = True
     
-    # Compute depth difference
-    depth_diff = torch.abs(depth_map[idx1] - depth_map[idx2])
-    
-    # Weighted smoothness loss
-    weighted_depth_diff = depth_diff * edge_weight
-    
-    return weight * weighted_depth_diff.mean()
+    return planar_mask.view(-1)
 
 
 def combine_structural_losses(depth_pred: torch.Tensor, 
@@ -269,19 +300,31 @@ def combine_structural_losses(depth_pred: torch.Tensor,
                             normals: Optional[torch.Tensor] = None,
                             rays_d: torch.Tensor = None,
                             depth_prior: Optional[torch.Tensor] = None,
-                            rgb_pred: Optional[torch.Tensor] = None,
                             height: int = None, width: int = None,
                             weights: dict = None) -> Tuple[torch.Tensor, dict]:
     """
-    Combine all structural losses with adaptive weighting for few-shot scenarios.
+    Combine all structural losses for PocketNeRF with improved overfitting resistance.
+    
+    Args:
+        depth_pred: Predicted depth [N_rays]
+        points: 3D points [N_rays, N_samples, 3]
+        normals: Surface normals [N_rays, 3] (optional)
+        rays_d: Ray directions [N_rays, 3]  
+        depth_prior: Prior depth estimates [N_rays] (optional)
+        height: Image height (for plane detection)
+        width: Image width (for plane detection)
+        weights: Dictionary of loss weights
+        
+    Returns:
+        total_loss: Combined structural loss
+        loss_dict: Dictionary of individual losses for logging
     """
     if weights is None:
         weights = {
             'depth_prior': 1.0,
-            'planarity': 2.0,      # Increased
-            'manhattan': 1.5,       # Increased
-            'normal_consistency': 1.0,
-            'edge_smoothness': 0.5
+            'planarity': 1.0, 
+            'manhattan': 1.0,
+            'normal_consistency': 0.5
         }
     
     device = depth_pred.device
@@ -294,33 +337,22 @@ def combine_structural_losses(depth_pred: torch.Tensor,
         loss_dict['depth_prior'] = depth_loss
         total_loss += depth_loss
     
-    # Planarity loss with stronger weight
+    # Improved planarity loss  
     if 'planarity' in weights and rays_d is not None:
-        planar_loss = planarity_loss(points, normals, depth_pred, rays_d, 
-                                   weights['planarity'], smoothness_weight=1.0)
+        planar_loss = planarity_loss_improved(depth_pred, rays_d, weights['planarity'])
         loss_dict['planarity'] = planar_loss
         total_loss += planar_loss
     
-    # Manhattan world loss - ensure it actually contributes
+    # Adaptive Manhattan world loss
     if normals is not None and 'manhattan' in weights:
-        # Add small noise to prevent all normals being identical
-        normals_noisy = normals + torch.randn_like(normals) * 0.01
-        manhattan_loss = manhattan_world_loss(normals_noisy, weights['manhattan'])
+        manhattan_loss = manhattan_world_loss_adaptive(normals, depth_pred, weights['manhattan'])
         loss_dict['manhattan'] = manhattan_loss
         total_loss += manhattan_loss
     
-    # Normal consistency loss with spatial coherence
+    # Improved normal consistency loss
     if normals is not None and 'normal_consistency' in weights:
-        normal_loss = normal_consistency_loss(normals, weight=weights['normal_consistency'], 
-                                            spatial_weight=2.0)
-        loss_dict['normal_consistency'] = normal_loss
+        normal_loss = normal_consistency_loss_improved(normals, depth_pred, weights['normal_consistency'])
+        loss_dict['normal_consistency'] = normal_loss  
         total_loss += normal_loss
     
-    # Edge-aware smoothness
-    if rgb_pred is not None and 'edge_smoothness' in weights:
-        smoothness_loss = edge_aware_smoothness_loss(depth_pred, rgb_pred, 
-                                                    weights['edge_smoothness'])
-        loss_dict['edge_smoothness'] = smoothness_loss
-        total_loss += smoothness_loss
-    
-    return total_loss, loss_dict
+    return total_loss, loss_dict 
