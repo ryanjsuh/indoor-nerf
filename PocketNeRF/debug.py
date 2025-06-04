@@ -87,6 +87,56 @@ def test_fixed_quantizer():
     print(f"Output would be identical to input")
     print(f"This is what PSNR ~23 dB corresponds to")
 
+def test_high_bit_quantizer():
+    """Test quantizer with high bit counts like in training"""
+    
+    # Test values similar to hash embeddings
+    x = torch.randn(100, 32) * 0.0001
+    
+    print("Input stats:")
+    print(f"  Mean: {x.mean():.6f}, Std: {x.std():.6f}")
+    print(f"  Min: {x.min():.6f}, Max: {x.max():.6f}")
+    
+    # Test with different bit widths
+    for bits in [8, 16, 32]:
+        print(f"\n=== Testing {bits}-bit quantization ===")
+        
+        quantizer = LearnedBitwidthQuantizer(
+            init_bits=float(bits),
+            min_bits=2.0,
+            max_bits=32.0,
+            symmetric=False
+        )
+        
+        # Put in eval mode to avoid training behavior
+        quantizer.eval()
+        
+        with torch.no_grad():
+            x_quant = quantizer(x)
+        
+        print(f"Quantizer params:")
+        print(f"  Soft bits: {quantizer.soft_bits.item():.1f}")
+        print(f"  Range scale: {quantizer.range_scale.item():.6f}")
+        if hasattr(quantizer, 'v_max') and quantizer.v_max is not None:
+            print(f"  V_max: {quantizer.v_max.item():.6f}")
+        
+        print(f"Output stats:")
+        print(f"  Mean: {x_quant.mean():.6f}, Std: {x_quant.std():.6f}")
+        print(f"  Min: {x_quant.min():.6f}, Max: {x_quant.max():.6f}")
+        
+        error = (x - x_quant).abs()
+        print(f"Error:")
+        print(f"  Mean: {error.mean():.6f}, Max: {error.max():.6f}")
+        
+        unique = torch.unique(x_quant).numel()
+        print(f"Unique values: {unique}")
+        
+        # Check if it's actually quantizing or just passing through
+        if unique > 1000:
+            print("  WARNING: Too many unique values - might not be quantizing properly!")
+
+
 if __name__ == "__main__":
-    test_fixed_quantizer()
+    test_high_bit_quantizer()
+    # test_fixed_quantizer()
     # test_quantizer()
