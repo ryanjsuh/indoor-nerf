@@ -17,3 +17,12 @@ precrop_iters = 500
 precrop_frac = 0.5
 
 half_res = False
+
+# PocketNeRF structural priors
+use_structural_priors = True
+predict_normals = True
+depth_prior_weight = 0.1
+planarity_weight = 0.05
+manhattan_weight = 0.02
+normal_consistency_weight = 0.01
+structural_loss_start_iter = 1000

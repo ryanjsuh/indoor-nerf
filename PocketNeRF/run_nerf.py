@@ -516,11 +516,13 @@ def render_rays(ray_batch,
 
     ret = {'rgb_map' : rgb_map, 'depth_map' : depth_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
     
+    # Always store points and ray directions for structural priors (needed even without normal prediction)
+    ret['pts'] = pts
+    ret['rays_d'] = rays_d
+    
     if predict_normals:
         ret['normal_map'] = normal_map
-        ret['pts'] = pts  # Store points for structural priors
-        ret['rays_d'] = rays_d  # Store ray directions for structural priors
-        
+
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
