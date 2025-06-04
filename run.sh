@@ -11,7 +11,7 @@ SCENE=$(basename "$DATA_SUBPATH")
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$REPO_ROOT/data/$DATA_SUBPATH"
-HASHNERF="$REPO_ROOT/baseline/HashNeRF-pytorch"
+HASHNERF="$REPO_ROOT/PocketNeRF"
 CONFIG="$HASHNERF/configs/$SCENE.txt"
 
 if [ ! -d "$DATA_DIR" ]; then
