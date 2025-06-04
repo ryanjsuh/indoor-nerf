@@ -176,17 +176,18 @@ class NeRFSmall(nn.Module):
                  input_ch=3, input_ch_views=3,
                  use_quantization=False, #Added for quant support
                  quantization_bits=8,    #Added for quant support
+                 predict_normals=False,  # Added for PocketNeRF
                  ):
         super(NeRFSmall, self).__init__()
 
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
-        self.use_quantization = use_quantization
+        self.predict_normals = predict_normals
 
         # sigma network
         self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
+        self.use_quantization = use_quantization
 
         sigma_net = []
         for l in range(num_layers):
@@ -204,23 +205,21 @@ class NeRFSmall(nn.Module):
 
         self.sigma_net = nn.ModuleList(sigma_net)
 
-        #Add quantizers for activations
-        if use_quantization:
-            #Quantizers for sigma network acts
-            self.sigma_act_quantizers = nn.ModuleList([
-                FakeQuantizer(num_bits=quantization_bits, symmetric=False)
-                for i in range(num_layers - 1)
-            ])
-            #quantizer for sigma network weights (only gonna do first layer for now)
-            self.sigma_weight_quantizer = FakeQuantizer(num_bits=quantization_bits, symmetric=True)
-        else:
-            self.sigma_act_quantizers = None
-            self.sigma_weight_quantizer = None
+        # quantization for fine-grained control over sigma network
+        if self.use_quantization:
+            # setup sigma network quantizers
+            self.sigma_weight_quantizer = LearnedBitwidthQuantizer(quantization_bits)
+            self.sigma_act_quantizers = nn.ModuleList()
 
+            # Activations before relu for each layer except the last
+            for l in range(num_layers - 1):
+                self.sigma_act_quantizers.append(LearnedBitwidthQuantizer(quantization_bits))
+        else:
+            self.sigma_weight_quantizer = None
+            self.sigma_act_quantizers = None
+        
         # color network
         self.num_layers_color = num_layers_color        
-        self.hidden_dim_color = hidden_dim_color
-        
         color_net =  []
         for l in range(num_layers_color):
             if l == 0:
@@ -236,6 +235,14 @@ class NeRFSmall(nn.Module):
             color_net.append(nn.Linear(in_dim, out_dim, bias=False))
 
         self.color_net = nn.ModuleList(color_net)
+        
+        # normal prediction network (optional for PocketNeRF)
+        if self.predict_normals:
+            self.normal_net = nn.Sequential(
+                nn.Linear(self.geo_feat_dim, hidden_dim//2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim//2, 3)
+            )
     
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
@@ -269,7 +276,14 @@ class NeRFSmall(nn.Module):
             
         # color = torch.sigmoid(h)
         color = h
-        outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+        
+        if self.predict_normals:
+            # predict normals from geometry features
+            normals = self.normal_net(geo_feat)
+            normals = F.normalize(normals, dim=-1)  # ensure unit length
+            outputs = torch.cat([color, sigma.unsqueeze(dim=-1), normals], -1)
+        else:
+            outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
         return outputs
 
@@ -363,3 +377,36 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+
+def compute_normals_from_density_gradients(network_fn, pts, create_graph=True):
+    """
+    Compute surface normals by taking gradients of density field.
+    This is an alternative to direct normal prediction.
+    
+    Args:
+        network_fn: NeRF network function
+        pts: 3D points [N_rays, N_samples, 3]
+        create_graph: Whether to create computation graph for gradients
+        
+    Returns:
+        normals: Surface normals [N_rays, N_samples, 3]
+    """
+    pts.requires_grad_(True)
+    
+    # Get density predictions
+    with torch.enable_grad():
+        raw = network_fn(pts)
+        sigma = raw[..., -1]  # density is last channel
+        
+        # Compute gradients
+        gradients = torch.autograd.grad(
+            outputs=sigma.sum(), 
+            inputs=pts,
+            create_graph=create_graph,
+            retain_graph=True
+        )[0]
+        
+        # Normalize to get unit normals
+        normals = F.normalize(gradients, dim=-1)
+        
+    return normals

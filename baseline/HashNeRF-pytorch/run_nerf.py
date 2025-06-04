@@ -19,6 +19,7 @@ from run_nerf_helpers import *
 from optimizer import MultiOptimizer
 from radam import RAdam
 from loss import sigma_sparsity_loss, total_variation_loss
+from structural_priors import combine_structural_losses 
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -236,7 +237,8 @@ def create_nerf(args):
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
                         use_quantization=use_quantization,
-                        quantization_bits=quantization_bits).to(device)
+                        quantization_bits=quantization_bits,
+                        predict_normals=args.predict_normals).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -254,7 +256,8 @@ def create_nerf(args):
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
                         use_quantization=use_quantization,
-                        quantization_bits=quantization_bits).to(device)
+                        quantization_bits=quantization_bits,
+                        predict_normals=args.predict_normals).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -317,6 +320,7 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'predict_normals' : args.predict_normals,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -332,18 +336,20 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, predict_normals=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        raw: [num_rays, num_samples along ray, 4 or 7]. Prediction from model.
         z_vals: [num_rays, num_samples along ray]. Integration time.
         rays_d: [num_rays, 3]. Direction of each ray.
+        predict_normals: bool. Whether the model predicts normals.
     Returns:
         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
         disp_map: [num_rays]. Disparity map. Inverse of depth map.
         acc_map: [num_rays]. Sum of weights along each ray.
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
+        normal_map: [num_rays, 3]. Surface normals (if predict_normals=True).
     """
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
@@ -353,18 +359,25 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    
+    if predict_normals:
+        sigma = raw[...,3]  # [N_rays, N_samples]
+        normals = raw[...,4:7]  # [N_rays, N_samples, 3]
+    else:
+        sigma = raw[...,3]  # [N_rays, N_samples]
+    
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+        noise = torch.randn(sigma.shape) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = np.random.rand(*list(sigma.shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
     # sigma_loss = sigma_sparsity_loss(raw[...,3])
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(sigma + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
@@ -381,7 +394,13 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     entropy = Categorical(probs=probs).entropy()
     sparsity_loss = entropy
 
-    return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss
+    if predict_normals:
+        # Render normal map using the same weights
+        normal_map = torch.sum(weights[...,None] * normals, -2)  # [N_rays, 3]
+        normal_map = F.normalize(normal_map, dim=-1)  # Ensure unit length
+        return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map
+    else:
+        return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss
 
 
 def render_rays(ray_batch,
@@ -397,7 +416,8 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False):
+                pytest=False,
+                predict_normals=False):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -417,6 +437,7 @@ def render_rays(ray_batch,
       white_bkgd: bool. If True, assume a white background.
       raw_noise_std: ...
       verbose: bool. If True, print more debugging info.
+      predict_normals: bool. If True, predict surface normals.
     Returns:
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       disp_map: [num_rays]. Disparity map. 1 / depth.
@@ -461,11 +482,20 @@ def render_rays(ray_batch,
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    
+    # Handle normal prediction
+    if predict_normals:
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map = raw2outputs(
+            raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=True)
+    else:
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(
+            raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=False)
 
     if N_importance > 0:
-
-        rgb_map_0, depth_map_0, acc_map_0, sparsity_loss_0 = rgb_map, depth_map, acc_map, sparsity_loss
+        if predict_normals:
+            rgb_map_0, depth_map_0, acc_map_0, sparsity_loss_0, normal_map_0 = rgb_map, depth_map, acc_map, sparsity_loss, normal_map
+        else:
+            rgb_map_0, depth_map_0, acc_map_0, sparsity_loss_0 = rgb_map, depth_map, acc_map, sparsity_loss
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -475,12 +505,22 @@ def render_rays(ray_batch,
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
         run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        if predict_normals:
+            rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map = raw2outputs(
+                raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=True)
+        else:
+            rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(
+                raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=False)
 
     ret = {'rgb_map' : rgb_map, 'depth_map' : depth_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
+    
+    if predict_normals:
+        ret['normal_map'] = normal_map
+        ret['pts'] = pts  # Store points for structural priors
+        ret['rays_d'] = rays_d  # Store ray directions for structural priors
+        
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -489,6 +529,8 @@ def render_rays(ray_batch,
         ret['acc0'] = acc_map_0
         ret['sparsity_loss0'] = sparsity_loss_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+        if predict_normals:
+            ret['normal0'] = normal_map_0
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
@@ -627,6 +669,22 @@ def config_parser():
                         help='enable quantization for hash embeddings and MLP')
     parser.add_argument("--quantization_bits", type=int, default=8,
                         help='number of bits for quantization (default: 8)')
+    
+    # PocketNeRF structural priors options
+    parser.add_argument("--use_structural_priors", action='store_true',
+                        help='enable structural priors for indoor scenes')
+    parser.add_argument("--predict_normals", action='store_true',
+                        help='enable normal prediction in the network')
+    parser.add_argument("--depth_prior_weight", type=float, default=0.1,
+                        help='weight for depth prior loss')
+    parser.add_argument("--planarity_weight", type=float, default=0.05,
+                        help='weight for planarity constraint loss')
+    parser.add_argument("--manhattan_weight", type=float, default=0.02,
+                        help='weight for Manhattan world assumption loss')
+    parser.add_argument("--normal_consistency_weight", type=float, default=0.01,
+                        help='weight for normal consistency loss')
+    parser.add_argument("--structural_loss_start_iter", type=int, default=1000,
+                        help='iteration to start applying structural losses')
     
     return parser
 
@@ -918,6 +976,49 @@ def train():
             loss = loss + args.tv_loss_weight * TV_loss
             if i>1000:
                 args.tv_loss_weight = 0.0
+
+        # Add PocketNeRF structural priors
+        if args.use_structural_priors and i >= args.structural_loss_start_iter:
+            # Prepare structural prior weights
+            structural_weights = {
+                'depth_prior': args.depth_prior_weight,
+                'planarity': args.planarity_weight,
+                'manhattan': args.manhattan_weight, 
+                'normal_consistency': args.normal_consistency_weight
+            }
+            
+            # Get required data for structural priors
+            depth_pred = depth
+            normals = extras.get('normal_map', None) if args.predict_normals else None
+            rays_d = extras.get('rays_d', None)
+            points = extras.get('pts', None)
+            
+            if depth_pred is not None:
+                try:
+                    # Compute structural losses
+                    structural_loss, structural_loss_dict = combine_structural_losses(
+                        depth_pred=depth_pred,
+                        points=points,
+                        normals=normals,
+                        rays_d=rays_d,
+                        depth_prior=None,  # Can be added later if you have depth priors
+                        height=None,  # For full image rendering
+                        width=None,   # For full image rendering
+                        weights=structural_weights
+                    )
+                    
+                    loss = loss + structural_loss
+                    
+                    # Log structural losses occasionally
+                    if i % args.i_print == 0:
+                        for loss_name, loss_val in structural_loss_dict.items():
+                            if torch.is_tensor(loss_val):
+                                print(f"  {loss_name}: {loss_val.item():.6f}")
+                
+                except Exception as e:
+                    # Don't break training if structural priors fail
+                    if i % args.i_print == 0:
+                        print(f"  Structural priors failed: {e}")
 
         loss.backward()
         # pdb.set_trace()
