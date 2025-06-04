@@ -93,7 +93,7 @@ class LearnedBitwidthQuantizer(nn.Module):
     @property
     def integer_bit_width(self):
         """Get the rounded integer bitwidth."""
-        return torch.round(self.bit_width)
+        return int(torch.round(self.bit_width).item())
     
     def get_quantization_params(self):
         """Calculate quantization parameters based on current bitwidth."""
@@ -109,14 +109,12 @@ class LearnedBitwidthQuantizer(nn.Module):
         return qmin, qmax
     
     def forward(self, x):
-        if not self.training:
-            # Use integer bitwidth during inference
-            B = int(self.integer_bit_width.item())
-        else:
-            # Use soft bitwidth during training for gradients
-            B = self.bit_width
-            
         qmin, qmax = self.get_quantization_params()
+
+        if not self.training:
+            B = self.integer_bit_width
+        else:
+            B = self.bit_width
         
         # Calculate step size
         if self.symmetric:
