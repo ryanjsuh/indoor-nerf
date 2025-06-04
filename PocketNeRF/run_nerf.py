@@ -338,20 +338,7 @@ def create_nerf(args):
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, predict_normals=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4 or 7]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-        predict_normals: bool. Whether the model predicts normals.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-        normal_map: [num_rays, 3]. Surface normals (if predict_normals=True).
-    """
+    """Transforms model's predictions to semantically meaningful values with improved numerical stability."""
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
     dists = z_vals[...,1:] - z_vals[...,:-1]
@@ -364,36 +351,69 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     if predict_normals:
         sigma = raw[...,3]  # [N_rays, N_samples]
         normals = raw[...,4:7]  # [N_rays, N_samples, 3]
+        # Ensure normals are valid
+        normals = F.normalize(normals.clamp(-10, 10), dim=-1)
     else:
         sigma = raw[...,3]  # [N_rays, N_samples]
+    
+    # Clamp sigma to prevent numerical issues
+    sigma = sigma.clamp(-20, 20)  # Prevent extreme values
     
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(sigma.shape) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
             noise = np.random.rand(*list(sigma.shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    # sigma_loss = sigma_sparsity_loss(raw[...,3])
     alpha = raw2alpha(sigma + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    
+    # Ensure alpha is in valid range
+    alpha = alpha.clamp(0.0, 1.0)
+    
+    # Compute weights with numerical stability
+    alpha_shifted = torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1)
+    weights = alpha * torch.cumprod(alpha_shifted, -1)[:, :-1]
+    
+    # Ensure weights are valid (no NaN or Inf)
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    weights = weights.clamp(0.0, 1.0)
+    
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
-    depth_map = torch.sum(weights * z_vals, -1) / torch.sum(weights, -1)
+    depth_map = torch.sum(weights * z_vals, -1)
+    # Handle edge case where weights sum to 0
+    weights_sum = torch.sum(weights, -1)
+    valid_mask = weights_sum > 1e-10
+    depth_map = torch.where(valid_mask, depth_map / weights_sum, z_vals.mean(-1))
+    
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map)
-    acc_map = torch.sum(weights, -1)
+    acc_map = weights_sum
 
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
-    # Calculate weights sparsity loss
-    probs = torch.cat([weights, (1.0 - weights.sum(-1, keepdim=True)).clamp(min=1e-6)], dim=-1)
-    entropy = Categorical(probs=probs).entropy()
-    sparsity_loss = entropy
+    # Calculate weights sparsity loss with better numerical stability
+    try:
+        # Ensure weights sum doesn't exceed 1
+        weights_sum_clamped = weights.sum(-1, keepdim=True).clamp(max=1.0 - 1e-6)
+        remainder = (1.0 - weights_sum_clamped).clamp(min=1e-6)
+        probs = torch.cat([weights, remainder], dim=-1)
+        
+        # Normalize to ensure it's a valid probability distribution
+        probs = probs / probs.sum(-1, keepdim=True).clamp(min=1e-10)
+        
+        # Check for NaN/Inf before creating distribution
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            # Fallback to uniform distribution
+            sparsity_loss = torch.zeros_like(weights[:, 0])
+        else:
+            entropy = Categorical(probs=probs).entropy()
+            sparsity_loss = entropy
+    except Exception as e:
+        # If entropy computation fails, use a simple sparsity measure
+        sparsity_loss = -torch.sum(weights * torch.log(weights + 1e-10), dim=-1)
 
     if predict_normals:
         # Render normal map using the same weights
@@ -419,42 +439,16 @@ def render_rays(ray_batch,
                 verbose=False,
                 pytest=False,
                 predict_normals=False):
-    """Volumetric rendering.
-    Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
-      predict_normals: bool. If True, predict surface normals.
-    Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
-      rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
-    """
+    """Volumetric rendering with improved numerical stability."""
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
+
+    # Ensure near/far are valid
+    near = near.clamp(min=1e-3)
+    far = far.clamp(min=near + 1e-3)
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
@@ -482,7 +476,21 @@ def render_rays(ray_batch,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
+    # Check for NaN in inputs
+    if torch.isnan(pts).any() or torch.isinf(pts).any():
+        print(f"WARNING: NaN/Inf detected in pts. rays_o stats: min={rays_o.min()}, max={rays_o.max()}")
+        print(f"rays_d stats: min={rays_d.min()}, max={rays_d.max()}")
+        print(f"z_vals stats: min={z_vals.min()}, max={z_vals.max()}")
+        # Clamp to reasonable values
+        pts = torch.nan_to_num(pts, nan=0.0, posinf=10.0, neginf=-10.0)
+
     raw = network_query_fn(pts, viewdirs, network_fn)
+    
+    # Check for NaN in network output
+    if torch.isnan(raw).any() or torch.isinf(raw).any():
+        print(f"WARNING: NaN/Inf detected in network output. Raw stats: min={raw.min()}, max={raw.max()}")
+        # Replace NaN/Inf with zeros
+        raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Handle normal prediction
     if predict_normals:
@@ -505,8 +513,16 @@ def render_rays(ray_batch,
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
+        # Check for NaN again
+        if torch.isnan(pts).any() or torch.isinf(pts).any():
+            pts = torch.nan_to_num(pts, nan=0.0, posinf=10.0, neginf=-10.0)
+
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
+        
+        # Check network output again
+        if torch.isnan(raw).any() or torch.isinf(raw).any():
+            raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         if predict_normals:
             rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map = raw2outputs(
@@ -535,9 +551,12 @@ def render_rays(ray_batch,
         if predict_normals:
             ret['normal0'] = normal_map_0
 
+    # Final check for NaN/Inf in outputs
     for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.")
+        if torch.is_tensor(ret[k]):
+            if torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any():
+                print(f"WARNING: {k} contains nan or inf. Replacing with zeros.")
+                ret[k] = torch.nan_to_num(ret[k], nan=0.0, posinf=0.0, neginf=0.0)
 
     return ret
 
@@ -1136,7 +1155,22 @@ def train():
             loss = loss + weight_decay * weight_reg
 
         loss.backward()
-        # pdb.set_trace()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(grad_vars, max_norm=1.0)
+        
+        # Check for NaN in gradients
+        has_nan_grad = False
+        for param in grad_vars:
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                has_nan_grad = True
+                break
+        
+        if has_nan_grad:
+            print(f"WARNING: NaN/Inf gradients detected at iteration {i}. Skipping update.")
+            optimizer.zero_grad()
+            continue
+        
         optimizer.step()
 
         # NOTE: IMPORTANT!
