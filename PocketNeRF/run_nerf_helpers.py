@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from hash_encoding import HashEmbedder, SHEncoder
+from quantization import FakeQuantizer, LearnedBitwidthQuantizer
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
@@ -63,9 +64,15 @@ def get_embedder(multires, args, i=0):
         embed = lambda x, eo=embedder_obj : eo.embed(x)
         out_dim = embedder_obj.out_dim
     elif i==1:
+        #Adding quantization arguments
+        use_quantization = getattr(args, 'use_quantization', False)
+        quantization_bits = getattr(args, 'quantization_bits', 8)
+
         embed = HashEmbedder(bounding_box=args.bounding_box, \
                             log2_hashmap_size=args.log2_hashmap_size, \
-                            finest_resolution=args.finest_res)
+                            finest_resolution=args.finest_res,
+                            use_quantization=use_quantization, #new
+                            quantization_bits=quantization_bits) #new
         out_dim = embed.out_dim
     elif i==2:
         embed = SHEncoder()
@@ -167,11 +174,14 @@ class NeRFSmall(nn.Module):
                  num_layers_color=4,
                  hidden_dim_color=64,
                  input_ch=3, input_ch_views=3,
+                 use_quantization=False, #Added for quant support
+                 quantization_bits=8,    #Added for quant support
                  ):
         super(NeRFSmall, self).__init__()
 
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
+        self.use_quantization = use_quantization
 
         # sigma network
         self.num_layers = num_layers
@@ -193,6 +203,38 @@ class NeRFSmall(nn.Module):
             sigma_net.append(nn.Linear(in_dim, out_dim, bias=False))
 
         self.sigma_net = nn.ModuleList(sigma_net)
+
+        #Add quantizers for activations
+        if use_quantization:
+            # # Quantizers for sigma network acts
+
+            # # uncomment for fixed quant
+            # self.sigma_act_quantizers = nn.ModuleList([
+            #     FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+            #     for i in range(num_layers - 1)
+            # ])
+            # #quantizer for sigma network weights (only gonna do first layer for now)
+            # self.sigma_weight_quantizer = FakeQuantizer(num_bits=quantization_bits, symmetric=True)
+
+            # Quant for activations
+            self.sigma_act_quantizers = nn.ModuleList([
+                LearnedBitwidthQuantizer(init_bits=float(quantization_bits),
+                                       min_bits=2.0,
+                                       max_bits=32.0,
+                                       symmetric=False)
+                for _ in range(num_layers - 1)
+            ])
+            # Quantizer for sigma network weights
+            self.sigma_weight_quantizer = LearnedBitwidthQuantizer(
+                init_bits=float(quantization_bits),
+                min_bits=2.0,
+                max_bits=32.0,
+                symmetric=True  # Weights are typically symmetric
+            )
+
+        else:
+            self.sigma_act_quantizers = None
+            self.sigma_weight_quantizer = None
 
         # color network
         self.num_layers_color = num_layers_color        
@@ -220,9 +262,20 @@ class NeRFSmall(nn.Module):
         # sigma
         h = input_pts
         for l in range(self.num_layers):
-            h = self.sigma_net[l](h)
+            #Quantize weights, only first layer for now
+            if self.use_quantization and l == 0 and self.sigma_weight_quantizer is not None:
+                #Create temp quantized weight
+                weight = self.sigma_net[l].weight
+                quantized_weight = self.sigma_weight_quantizer(weight)
+                h = F.linear(h, quantized_weight, None)
+            else:
+                h = self.sigma_net[l](h)
+
             if l != self.num_layers - 1:
                 h = F.relu(h, inplace=True)
+                #Quantize activations
+                if self.use_quantization and self.sigma_act_quantizers is not None:
+                    h = self.sigma_act_quantizers[l](h)
 
         sigma, geo_feat = h[..., 0], h[..., 1:]
         
