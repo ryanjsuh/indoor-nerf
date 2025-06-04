@@ -884,7 +884,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 50000 + 1
+    N_iters = 10000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -978,7 +978,28 @@ def train():
                 args.tv_loss_weight = 0.0
 
         # Add PocketNeRF structural priors
+        structural_loss_total = 0.0
+        structural_loss_dict = {}
+        
         if args.use_structural_priors and i >= args.structural_loss_start_iter:
+            # Announce when structural priors first activate
+            if i == args.structural_loss_start_iter:
+                print("\n" + "="*80)
+                print(f"🏗️  ACTIVATING POCKETNERF STRUCTURAL PRIORS AT ITERATION {i}")
+                print("="*80)
+                print(f"📋 Configuration:")
+                print(f"   Depth Prior Weight: {args.depth_prior_weight}")
+                print(f"   Planarity Weight: {args.planarity_weight}")
+                print(f"   Manhattan Weight: {args.manhattan_weight}")
+                print(f"   Normal Consistency Weight: {args.normal_consistency_weight}")
+                print(f"   Predict Normals: {args.predict_normals}")
+                print(f"📈 Current Baseline PSNR: {psnr.item():.2f} dB")
+                print(f"🎯 Expecting improvement in:")
+                print(f"   - Planar surface quality (walls, floors)")
+                print(f"   - Geometric consistency")
+                print(f"   - Few-shot reconstruction stability")
+                print("="*80 + "\n")
+            
             # Prepare structural prior weights
             structural_weights = {
                 'depth_prior': args.depth_prior_weight,
@@ -1007,18 +1028,19 @@ def train():
                         weights=structural_weights
                     )
                     
+                    structural_loss_total = structural_loss.item() if torch.is_tensor(structural_loss) else structural_loss
                     loss = loss + structural_loss
                     
-                    # Log structural losses occasionally
-                    if i % args.i_print == 0:
-                        for loss_name, loss_val in structural_loss_dict.items():
-                            if torch.is_tensor(loss_val):
-                                print(f"  {loss_name}: {loss_val.item():.6f}")
-                
                 except Exception as e:
                     # Don't break training if structural priors fail
                     if i % args.i_print == 0:
-                        print(f"  Structural priors failed: {e}")
+                        print(f"  ⚠️  Structural priors failed: {e}")
+                        
+        elif args.use_structural_priors and i < args.structural_loss_start_iter:
+            # Show countdown to structural priors activation
+            if i % args.i_print == 0 and i > args.structural_loss_start_iter - 200:
+                remaining = args.structural_loss_start_iter - i
+                print(f"  📊 Structural priors activate in {remaining} iterations...")
 
         loss.backward()
         # pdb.set_trace()
@@ -1080,11 +1102,64 @@ def train():
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
-
-
+            
+            # Additional PocketNeRF evaluation logging
+            if args.use_structural_priors and i >= args.structural_loss_start_iter:
+                print(f"📊 PocketNeRF Status @ {i}:")
+                print(f"   Structural Loss: {structural_loss_total:.6f}")
+                if len(psnr_list) >= 10:
+                    # Compare recent performance to pre-structural priors
+                    pre_struct_idx = max(0, args.structural_loss_start_iter - i_train.shape[0] * 10)
+                    if pre_struct_idx < len(psnr_list):
+                        recent_avg = np.mean(psnr_list[-10:])
+                        pre_struct_avg = np.mean(psnr_list[max(0, pre_struct_idx-10):pre_struct_idx+10])
+                        improvement = recent_avg - pre_struct_avg
+                        status = "📈 Improving" if improvement > 0.5 else "📉 Declining" if improvement < -0.5 else "➡️ Stable"
+                        print(f"   PSNR vs pre-structural: {improvement:+.2f} dB ({status})")
 
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            # Enhanced logging for PocketNeRF monitoring
+            base_msg = f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.2f}"
+            
+            # Add structural priors information
+            if args.use_structural_priors:
+                if i >= args.structural_loss_start_iter:
+                    # Show breakdown of structural losses
+                    struct_msg = f" | Struct: {structural_loss_total:.6f}"
+                    if structural_loss_dict:
+                        components = []
+                        for loss_name, loss_val in structural_loss_dict.items():
+                            if torch.is_tensor(loss_val):
+                                components.append(f"{loss_name}: {loss_val.item():.6f}")
+                        if components:
+                            struct_msg += f" ({', '.join(components)})"
+                    base_msg += struct_msg
+                    
+                    # Check if normals are being predicted
+                    if args.predict_normals and 'normal_map' in extras:
+                        normal_map = extras['normal_map']
+                        normal_magnitude = torch.norm(normal_map, dim=-1).mean()
+                        base_msg += f" | Norm: {normal_magnitude:.3f}"
+                        
+                elif i > args.structural_loss_start_iter - 200:
+                    remaining = args.structural_loss_start_iter - i
+                    base_msg += f" | Struct in: {remaining}"
+            
+            # PSNR trend analysis (every 500 iterations)
+            if i > 0 and i % 500 == 0 and len(psnr_list) > 5:
+                recent_psnr = psnr_list[-5:]  # Last 5 measurements
+                psnr_trend = recent_psnr[-1] - recent_psnr[0]
+                trend_emoji = "📈" if psnr_trend > 0 else "📉" if psnr_trend < -0.1 else "➡️"
+                base_msg += f" | Trend: {trend_emoji} {psnr_trend:+.2f}"
+                
+                # Milestone check
+                if psnr.item() > 25:
+                    base_msg += " 🎯"
+                elif psnr.item() > 20:
+                    base_msg += " ✅"
+            
+            tqdm.write(base_msg)
+            
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)
