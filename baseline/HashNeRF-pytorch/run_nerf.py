@@ -329,8 +329,61 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
+    #Added for quant logging
+    if args.use_quantization:
+        print_model_info(model, embed_fn, "Quantized Model")
+
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
+#Function for quant info
+def print_model_info(model, embed_fn, name="Model"):
+    """Print model size and quantization info"""
+    print(f"\n========== {name} Info ==========")
+    
+    # Check if embed_fn has quantizers
+    if hasattr(embed_fn, 'quantizers') and embed_fn.quantizers is not None:
+        print(f"Hash Embedding Quantization: ENABLED")
+        print(f"  - Number of quantizers: {len(embed_fn.quantizers)}")
+        print(f"  - Bits per quantizer: {embed_fn.quantizers[0].num_bits}")
+    else:
+        print(f"Hash Embedding Quantization: DISABLED")
+    
+    # Check if model has quantizers
+    if hasattr(model, 'sigma_weight_quantizer') and model.sigma_weight_quantizer is not None:
+        print(f"MLP Quantization: ENABLED")
+        print(f"  - Weight quantizer bits: {model.sigma_weight_quantizer.num_bits}")
+        print(f"  - Activation quantizers: {len(model.sigma_act_quantizers)}")
+    else:
+        print(f"MLP Quantization: DISABLED")
+    
+    # Calculate model size
+    total_params = 0
+    total_bits = 0
+    
+    # Count parameters
+    for name, param in embed_fn.named_parameters():
+        n_params = param.numel()
+        total_params += n_params
+        # Estimate bits (32 for float32 by default)
+        if 'quantizer' not in name:  # Skip quantizer parameters themselves
+            if hasattr(embed_fn, 'use_quantization') and embed_fn.use_quantization:
+                total_bits += n_params * 8  # or whatever bit width
+            else:
+                total_bits += n_params * 32
+    
+    for name, param in model.named_parameters():
+        n_params = param.numel()
+        total_params += n_params
+        if 'quantizer' not in name:
+            if hasattr(model, 'use_quantization') and model.use_quantization:
+                total_bits += n_params * 8
+            else:
+                total_bits += n_params * 32
+    
+    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Estimated size (MB): {total_bits / (8 * 1024 * 1024):.2f}")
+    print(f"Full precision size (MB): {total_params * 32 / (8 * 1024 * 1024):.2f}")
+    print("================================\n")
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
@@ -826,7 +879,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 50000 + 1
+    N_iters = 10000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -984,6 +1037,23 @@ def train():
 
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+
+            # START OF ADDITION FOR QUANT LOGGING
+            if args.use_quantization and i > 0:
+                from quantization import calculate_fqr
+                # Collect all quantizers
+                quantizers = []
+                if hasattr(render_kwargs_train["embed_fn"], 'quantizers'):
+                    quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+                if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers'):
+                    quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
+                    if render_kwargs_train["network_fn"].sigma_weight_quantizer:
+                        quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
+                
+                avg_bits = calculate_fqr(quantizers)
+                tqdm.write(f"[QUANT] Average bits: {avg_bits:.2f}, Num quantizers: {len(quantizers)}")
+            #END QUANT LOGGING
+
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)
