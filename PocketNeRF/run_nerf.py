@@ -945,7 +945,7 @@ def train():
             time_elapsed=time.time() - time0,
             loss=loss.item(),
             psnr=psnr.item(),
-            lr=new_lrate,
+            lr=optimizer.param_groups[0]['lr'],
             quantizers=quantizers
         )
 
