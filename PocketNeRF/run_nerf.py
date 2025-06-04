@@ -925,7 +925,7 @@ def train():
             if i>1000:
                 args.tv_loss_weight = 0.0
 
-        loss.backward()
+        loss.backward(retain_graph=True)
         # pdb.set_trace()
         optimizer.step()
 
