@@ -44,8 +44,8 @@ min_structural_weight = 0.00001      # Floor to prevent zero
 
 # Base HashNeRF Settings - Closer to Original
 lrate = 5e-4                         # *** RESTORED to default (was reduced to 1e-4) ***
-sparse_loss_weight = 1e-10           # Default sparsity regularization
-tv_loss_weight = 1e-6                # Default total variation regularization
+sparse-loss-weight = 1e-10           # Default sparsity regularization
+tv-loss-weight = 1e-6                # Default total variation regularization
 
 # Reasonable logging intervals
 i_video = 50000                      # Enable video rendering but less frequent
