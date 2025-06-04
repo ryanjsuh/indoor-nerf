@@ -991,35 +991,31 @@ def train():
                             if not hasattr(train, 'best_loss'):
                                 train.best_loss = current_loss
                             train.best_loss = min(train.best_loss, current_loss)
-                            target_metric = train.best_loss * 1.1  # Allow 10% degradation
+                            target_metric = train.best_loss * 1.2  # Allow 20% degradation
                         
                         # Update each quantizer's bitwidth
                         with torch.no_grad():
                             for idx, q in enumerate(quantizers):
                                 if hasattr(q, 'soft_bits'):
+                                    current_bits = q.soft_bits.item()
                                     # Current performance vs target
                                     loss_ratio = current_loss / target_metric
                                     
                                     # Adaptive bit adjustment based on performance
-                                    if loss_ratio < 0.9:  # Much better than target
-                                        # Aggressively reduce bits
-                                        bit_delta = -0.5
-                                    elif loss_ratio < 1.0:  # Better than target
-                                        # Moderately reduce bits
-                                        bit_delta = -0.2
-                                    elif loss_ratio < 1.1:  # Slightly worse than target
-                                        # Slightly reduce bits if possible
-                                        bit_delta = -0.05
-                                    elif loss_ratio < 1.5:  # Moderately worse
-                                        # Keep bits stable
-                                        bit_delta = 0.0
-                                    else:  # Much worse
-                                        # Increase bits
+                                    if loss_ratio < 0.95:  # Better than target
+                                        bit_delta = -0.3
+                                    elif loss_ratio < 1.05:  # Close to target
+                                        bit_delta = -0.1
+                                    else:  # Worse than target
                                         bit_delta = 0.2
                                     
                                     # Apply bit penalty to encourage lower bits
-                                    bit_penalty = args.bit_penalty * q.soft_bits.item() / 32.0
+                                    bit_penalty = args.bit_penalty * current_bits / 8.0
                                     bit_delta -= bit_penalty
+
+                                    # ADD FIX 3 HERE: Add layer-wise variation
+                                    layer_factor = 1.0 + (idx - len(quantizers)/2) * 0.02  # Slight variation per layer
+                                    bit_delta *= layer_factor
                                     
                                     # Update bitwidth
                                     q.soft_bits.data += bit_delta
