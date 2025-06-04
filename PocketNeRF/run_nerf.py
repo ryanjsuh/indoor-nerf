@@ -236,9 +236,9 @@ def create_nerf(args):
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch=input_ch, input_ch_views=input_ch_views,
-                        use_quantization=args.use_quantization,
-                        quantization_bits=args.quantization_bits).to(device)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                 use_quantization=args.use_quantization,
+                 quantization_bits=args.quantization_bits).to(device)
     grad_vars = list(model.parameters())
 
     model_fine = None
