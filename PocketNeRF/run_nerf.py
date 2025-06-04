@@ -675,25 +675,31 @@ def config_parser():
     
     # PocketNeRF structural priors options
     parser.add_argument("--use_structural_priors", action='store_true',
-                        help='enable structural priors for indoor scenes')
+                    help='enable structural priors for indoor scenes')
     parser.add_argument("--predict_normals", action='store_true',
                         help='enable normal prediction in the network')
-    parser.add_argument("--depth_prior_weight", type=float, default=0.05,
+    parser.add_argument("--depth_prior_weight", type=float, default=0.2,  # Increased from 0.05
                         help='weight for depth prior loss')
-    parser.add_argument("--planarity_weight", type=float, default=0.025,
+    parser.add_argument("--planarity_weight", type=float, default=0.1,    # Increased from 0.025
                         help='weight for planarity constraint loss')
-    parser.add_argument("--manhattan_weight", type=float, default=0.01,
+    parser.add_argument("--manhattan_weight", type=float, default=0.05,   # Increased from 0.01
                         help='weight for Manhattan world assumption loss')
-    parser.add_argument("--normal_consistency_weight", type=float, default=0.005,
+    parser.add_argument("--normal_consistency_weight", type=float, default=0.02,  # Increased from 0.005
                         help='weight for normal consistency loss')
-    parser.add_argument("--structural_loss_start_iter", type=int, default=1000,
+    parser.add_argument("--structural_loss_start_iter", type=int, default=500,    # Earlier! Was 1000
                         help='iteration to start applying structural losses')
-    
-    # Add new args for overfitting control
-    parser.add_argument("--overfitting_psnr_gap_threshold", type=float, default=7.0,
-                        help='PSNR gap between train and test to trigger structural weight reduction for overfitting.')
-    parser.add_argument("--overfitting_reduction_factor", type=float, default=0.75,
-                        help='Factor to reduce structural weights by when overfitting is detected (e.g., 0.75 for 25% reduction).')
+    parser.add_argument("--edge_smoothness_weight", type=float, default=0.01,     # New!
+                        help='weight for edge-aware smoothness loss')
+
+    # Add warmup period for structural losses
+    parser.add_argument("--structural_warmup_iters", type=int, default=500,
+                        help='number of iterations to warmup structural losses')
+
+    # Stronger overfitting control
+    parser.add_argument("--overfitting_psnr_gap_threshold", type=float, default=5.0,  # Was 7.0
+                        help='PSNR gap threshold for overfitting detection')
+    parser.add_argument("--overfitting_reduction_factor", type=float, default=0.5,     # Was 0.75
+                        help='Factor to reduce structural weights when overfitting')
     
     return parser
 
@@ -1003,11 +1009,17 @@ def train():
             if i>1000:
                 args.tv_loss_weight = 0.0
 
-        # Add PocketNeRF structural priors
+        # Add PocketNeRF structural priors with warmup and better integration
         structural_loss_total = 0.0
         structural_loss_dict = {}
         
         if args.use_structural_priors and i >= args.structural_loss_start_iter:
+            # Calculate warmup factor
+            warmup_factor = 1.0
+            if i < args.structural_loss_start_iter + args.structural_warmup_iters:
+                progress = (i - args.structural_loss_start_iter) / args.structural_warmup_iters
+                warmup_factor = progress  # Linear warmup from 0 to 1
+            
             # Announce when structural priors first activate
             if i == args.structural_loss_start_iter:
                 time_metrics['structural_priors_start_time'] = time.time()
@@ -1021,48 +1033,47 @@ def train():
                 print(f"   Planarity Weight: {args.planarity_weight}")
                 print(f"   Manhattan Weight: {args.manhattan_weight}")
                 print(f"   Normal Consistency Weight: {args.normal_consistency_weight}")
+                print(f"   Edge Smoothness Weight: {args.edge_smoothness_weight}")
                 print(f"   Predict Normals: {args.predict_normals}")
+                print(f"   Warmup Iterations: {args.structural_warmup_iters}")
                 print(f"📈 Current Baseline PSNR: {psnr.item():.2f} dB")
                 print(f"⏱️  Time to Activation: {structural_activation_time/60:.1f} minutes")
-                print(f"🎯 Expecting improvement in:")
-                print(f"   - Planar surface quality (walls, floors)")
-                print(f"   - Geometric consistency")
-                print(f"   - Few-shot reconstruction stability")
                 print("="*80 + "\n")
             
-            # Dynamic weight adjustment to prevent overfitting
-            # Reduce weights if training much better than recent test performance
-            if args.use_structural_priors and i > args.structural_loss_start_iter and \
-               i > 2000 and i % args.i_testset == 0 and \
-               hasattr(args, '_last_test_psnr') and args._last_test_psnr is not None:
-                
-                # Ensure psnr_list is not empty and has enough elements
-                if len(psnr_list) >= 10:
-                    recent_train_psnr = np.mean(psnr_list[-10:]) # psnr_list contains train PSNRs
+            # Dynamic weight adjustment for overfitting prevention
+            # Check more frequently and act more aggressively
+            if i > args.structural_loss_start_iter + 500 and i % 500 == 0:
+                # Use recent average instead of single value
+                if len(psnr_list) >= 50:
+                    recent_train_psnr = np.mean([p.item() if torch.is_tensor(p) else p for p in psnr_list[-50:]])
                     
-                    psnr_gap_threshold = getattr(args, 'overfitting_psnr_gap_threshold', 7.0)
-                    reduction_factor = getattr(args, 'overfitting_reduction_factor', 0.75)
-                    min_weight_cap = 0.0001 # Minimum weight to prevent full zeroing
-
-                    if recent_train_psnr - args._last_test_psnr > psnr_gap_threshold:
-                        print(f"\n⚠️  Potential overfitting detected at iteration {i}")
-                        print(f"   Train PSNR (avg last 10): {recent_train_psnr:.2f} dB, Last Actual Test PSNR: {args._last_test_psnr:.2f} dB")
-                        print(f"   PSNR Gap: {recent_train_psnr - args._last_test_psnr:.2f} dB (Threshold: {psnr_gap_threshold:.1f} dB)")
-                        print(f"   Reducing structural prior weights by factor {reduction_factor}")
+                    # If we have test PSNR from recent evaluation
+                    if hasattr(args, '_last_test_psnr') and args._last_test_psnr is not None:
+                        psnr_gap = recent_train_psnr - args._last_test_psnr
                         
-                        args.depth_prior_weight = max(args.depth_prior_weight * reduction_factor, min_weight_cap)
-                        args.planarity_weight = max(args.planarity_weight * reduction_factor, min_weight_cap)
-                        args.manhattan_weight = max(args.manhattan_weight * reduction_factor, min_weight_cap)
-                        args.normal_consistency_weight = max(args.normal_consistency_weight * reduction_factor, min_weight_cap)
-                        
-                        print(f"   New weights: depth={args.depth_prior_weight:.4f}, planarity={args.planarity_weight:.4f}, manhattan={args.manhattan_weight:.4f}, normal_consistency={args.normal_consistency_weight:.4f}")
+                        if psnr_gap > args.overfitting_psnr_gap_threshold:
+                            print(f"\n⚠️  Overfitting detected at iteration {i}")
+                            print(f"   Train PSNR: {recent_train_psnr:.2f}, Test PSNR: {args._last_test_psnr:.2f}")
+                            print(f"   Gap: {psnr_gap:.2f} dB (Threshold: {args.overfitting_psnr_gap_threshold:.1f})")
+                            
+                            # Increase structural weights instead of decreasing!
+                            # When overfitting, we need MORE regularization
+                            increase_factor = 1.5
+                            args.planarity_weight *= increase_factor
+                            args.manhattan_weight *= increase_factor
+                            args.normal_consistency_weight *= increase_factor
+                            args.edge_smoothness_weight *= increase_factor
+                            
+                            print(f"   Increasing structural weights by {increase_factor}x for stronger regularization")
+                            print(f"   New weights: planarity={args.planarity_weight:.4f}, manhattan={args.manhattan_weight:.4f}")
             
-            # Prepare structural prior weights
+            # Prepare structural prior weights with warmup
             structural_weights = {
-                'depth_prior': args.depth_prior_weight,
-                'planarity': args.planarity_weight,
-                'manhattan': args.manhattan_weight, 
-                'normal_consistency': args.normal_consistency_weight
+                'depth_prior': args.depth_prior_weight * warmup_factor,
+                'planarity': args.planarity_weight * warmup_factor,
+                'manhattan': args.manhattan_weight * warmup_factor,
+                'normal_consistency': args.normal_consistency_weight * warmup_factor,
+                'edge_smoothness': args.edge_smoothness_weight * warmup_factor
             }
             
             # Get required data for structural priors
@@ -1071,17 +1082,21 @@ def train():
             rays_d = extras.get('rays_d', None)
             points = extras.get('pts', None)
             
-            if depth_pred is not None:
+            # IMPORTANT: Pass RGB predictions for edge-aware smoothness
+            rgb_pred = rgb
+            
+            if depth_pred is not None and rays_d is not None:
                 try:
-                    # Compute structural losses
+                    # Compute structural losses with RGB for edge awareness
                     structural_loss, structural_loss_dict = combine_structural_losses(
                         depth_pred=depth_pred,
                         points=points,
                         normals=normals,
                         rays_d=rays_d,
-                        depth_prior=None,  # Can be added later if you have depth priors
-                        height=None,  # For full image rendering
-                        width=None,   # For full image rendering
+                        rgb_pred=rgb_pred,  # Pass RGB!
+                        depth_prior=None,   # Can add monocular depth later
+                        height=None,
+                        width=None,
                         weights=structural_weights
                     )
                     
@@ -1089,15 +1104,36 @@ def train():
                     loss = loss + structural_loss
                     
                 except Exception as e:
-                    # Don't break training if structural priors fail
                     if i % args.i_print == 0:
-                        print(f"  ⚠️  Structural priors failed: {e}")
+                        print(f"  ⚠️  Structural priors error: {e}")
+                        import traceback
+                        traceback.print_exc()
                         
         elif args.use_structural_priors and i < args.structural_loss_start_iter:
             # Show countdown to structural priors activation
             if i % args.i_print == 0 and i > args.structural_loss_start_iter - 200:
                 remaining = args.structural_loss_start_iter - i
                 print(f"  📊 Structural priors activate in {remaining} iterations...")
+        
+        # Add L2 regularization on network weights to prevent overfitting
+        if i > 1000:  # After initial convergence
+            weight_reg = 0.0
+            for param in model.parameters():
+                weight_reg += torch.norm(param, 2)
+            if model_fine is not None:
+                for param in model_fine.parameters():
+                    weight_reg += torch.norm(param, 2)
+            
+            # Adaptive weight decay based on overfitting
+            weight_decay = 1e-6
+            if hasattr(args, '_last_test_psnr') and args._last_test_psnr is not None:
+                if len(psnr_list) >= 50:
+                    recent_train = np.mean([p.item() if torch.is_tensor(p) else p for p in psnr_list[-50:]])
+                    gap = recent_train - args._last_test_psnr
+                    if gap > 5.0:  # Significant overfitting
+                        weight_decay *= (gap / 5.0)  # Scale weight decay with gap
+            
+            loss = loss + weight_decay * weight_reg
 
         loss.backward()
         # pdb.set_trace()
@@ -1206,22 +1242,21 @@ def train():
             
             if avg_test_psnr is not None:
                 args._last_test_psnr = avg_test_psnr
-                print(f"  📈 Updated args._last_test_psnr to: {args._last_test_psnr:.2f} dB")
+                print(f"  📈 Test PSNR: {args._last_test_psnr:.2f} dB")
+                
+                # Store test PSNR history for tracking
+                if not hasattr(args, '_test_psnr_history'):
+                    args._test_psnr_history = []
+                args._test_psnr_history.append((i, avg_test_psnr))
+                
+                # Check if test performance is improving
+                if len(args._test_psnr_history) > 1:
+                    prev_psnr = args._test_psnr_history[-2][1]
+                    improvement = avg_test_psnr - prev_psnr
+                    if improvement < -0.5:  # Test PSNR decreased significantly
+                        print(f"  ⚠️  Test PSNR decreased by {-improvement:.2f} dB!")
+                        # Could trigger additional regularization here
 
-            # Additional PocketNeRF evaluation logging
-            if args.use_structural_priors and i >= args.structural_loss_start_iter:
-                print(f"📊 PocketNeRF Status @ {i}:")
-                print(f"   Structural Loss: {structural_loss_total:.6f}")
-                if len(psnr_list) >= 10:
-                    # Compare recent performance to pre-structural priors
-                    pre_struct_idx = max(0, args.structural_loss_start_iter - i_train.shape[0] * 10)
-                    if pre_struct_idx < len(psnr_list):
-                        recent_avg = np.mean(psnr_list[-10:])
-                        pre_struct_avg = np.mean(psnr_list[max(0, pre_struct_idx-10):pre_struct_idx+10])
-                        improvement = recent_avg - pre_struct_avg
-                        status = "📈 Improving" if improvement > 0.5 else "📉 Declining" if improvement < -0.5 else "➡️ Stable"
-                        print(f"   PSNR vs pre-structural: {improvement:+.2f} dB ({status})")
-            
         if i%args.i_print==0:
             # Enhanced logging for PocketNeRF monitoring
             base_msg = f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.2f}"
