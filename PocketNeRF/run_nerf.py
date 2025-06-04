@@ -15,6 +15,7 @@ import pickle
 
 import matplotlib.pyplot as plt
 
+from metric_logger import MetricsLogger
 from run_nerf_helpers import *
 from optimizer import MultiOptimizer
 from radam import RAdam
@@ -770,6 +771,7 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    metrics_logger = MetricsLogger(basedir, expname, args)
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -838,6 +840,8 @@ def train():
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
+
+    train.best_loss = float('inf')
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
 
@@ -928,23 +932,46 @@ def train():
         loss.backward()
         optimizer.step()
 
+        # Log training metrics  # ADD THIS COMMENT
+        if args.use_quantization:  # ADD THIS BLOCK
+            quantizers = {
+                'embed': render_kwargs_train["embed_fn"].quantizers if hasattr(render_kwargs_train["embed_fn"], 'quantizers') else None,
+                'network': render_kwargs_train["network_fn"].sigma_act_quantizers if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers') else None
+            }
+        else:
+            quantizers = None
+
+        metrics_logger.log_iteration(iteration=i,
+            time_elapsed=time.time() - time0,
+            loss=loss.item(),
+            psnr=psnr.item(),
+            lr=new_lrate,
+            quantizers=quantizers
+        )
+
         # A-CAQ Training (Adversarial Content-Aware Quantization)
         if args.use_acaq and args.use_quantization and i >= args.acaq_start_iter:
             # Collect all quantizers
             quantizers = []
+            
+            # Get quantizers from hash embeddings
             if hasattr(render_kwargs_train["embed_fn"], 'quantizers') and render_kwargs_train["embed_fn"].quantizers is not None:
                 quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+            
+            # Get quantizers from network
             if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers') and render_kwargs_train["network_fn"].sigma_act_quantizers is not None:
                 quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
             if hasattr(render_kwargs_train["network_fn"], 'sigma_weight_quantizer') and render_kwargs_train["network_fn"].sigma_weight_quantizer is not None:
                 quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
             
-            if quantizers:  # Only if we have quantizers with learnable bitwidths
-                # Collect bitwidths
+            if quantizers and len(quantizers) > 0:
+                # Calculate average bits and current loss
                 bitwidths = []
                 for q in quantizers:
-                    if hasattr(q, 'bit_width'):  # LearnedBitwidthQuantizer
+                    if hasattr(q, 'bit_width'):
                         bitwidths.append(q.bit_width)
+                    elif hasattr(q, 'soft_bits'):
+                        bitwidths.append(q.soft_bits)
                 
                 if bitwidths:
                     bitwidths = torch.stack(bitwidths)
@@ -952,32 +979,86 @@ def train():
                     
                     # Update bitwidths every 10 iterations
                     if i % 10 == 0:
-                        target_metric = args.target_metric if args.target_metric is not None else 0.001
+                        current_loss = img_loss.item()
                         
+                        # Determine target based on mode
+                        if args.target_metric is not None:
+                            target_metric = args.target_metric
+                        else:
+                            # MDL mode: try to maintain quality while reducing bits
+                            # Use slightly worse than best achieved loss
+                            if not hasattr(train, 'best_loss'):
+                                train.best_loss = current_loss
+                            train.best_loss = min(train.best_loss, current_loss)
+                            target_metric = train.best_loss * 1.1  # Allow 10% degradation
+                        
+                        # Update each quantizer's bitwidth
                         with torch.no_grad():
-                            for q in quantizers:
+                            for idx, q in enumerate(quantizers):
                                 if hasattr(q, 'soft_bits'):
-                                    if img_loss < target_metric:
-                                        # Loss is good, can reduce bits
-                                        q.soft_bits.data -= 0.1
-                                    else:
-                                        # Loss is bad, might need more bits
-                                        q.soft_bits.data += 0.05
+                                    # Current performance vs target
+                                    loss_ratio = current_loss / target_metric
                                     
+                                    # Adaptive bit adjustment based on performance
+                                    if loss_ratio < 0.9:  # Much better than target
+                                        # Aggressively reduce bits
+                                        bit_delta = -0.5
+                                    elif loss_ratio < 1.0:  # Better than target
+                                        # Moderately reduce bits
+                                        bit_delta = -0.2
+                                    elif loss_ratio < 1.1:  # Slightly worse than target
+                                        # Slightly reduce bits if possible
+                                        bit_delta = -0.05
+                                    elif loss_ratio < 1.5:  # Moderately worse
+                                        # Keep bits stable
+                                        bit_delta = 0.0
+                                    else:  # Much worse
+                                        # Increase bits
+                                        bit_delta = 0.2
+                                    
+                                    # Apply bit penalty to encourage lower bits
+                                    bit_penalty = args.bit_penalty * q.soft_bits.item() / 32.0
+                                    bit_delta -= bit_penalty
+                                    
+                                    # Update bitwidth
+                                    q.soft_bits.data += bit_delta
+                                    
+                                    # Clamp to valid range
                                     q.soft_bits.data = torch.clamp(q.soft_bits.data, q.min_bits, q.max_bits)
+                    # Log A-CAQ update  # ADD THIS COMMENT
+                    metrics_logger.log_acaq_update(  # ADD THIS BLOCK
+                        target_metric=target_metric,
+                        loss_ratio=loss_ratio,
+                        bit_adjustments=[q.soft_bits.item() for q in quantizers if hasattr(q, 'soft_bits')]
+                    )  # END OF ADDED BLOCK
                     
+
                     # Log every i_print iterations
                     if i % args.i_print == 0:
-                        # Log current bitwidths for each quantizer
-                        bit_info = []
-                        for idx, q in enumerate(quantizers):
-                            if hasattr(q, 'soft_bits'):
-                                bit_info.append(f"Q{idx}: {q.soft_bits.item():.2f}")
+                        # Calculate per-component bitwidths
+                        embed_bits = []
+                        mlp_bits = []
                         
-                        tqdm.write(f"[A-CAQ] Avg bits: {avg_bits:.2f} | Target: {args.target_metric} | Current loss: {img_loss.item():.4f}")
-                        if bit_info:
-                            tqdm.write(f"[BITS] {' | '.join(bit_info)}")
-
+                        if hasattr(render_kwargs_train["embed_fn"], 'quantizers'):
+                            for q in render_kwargs_train["embed_fn"].quantizers:
+                                if hasattr(q, 'soft_bits'):
+                                    embed_bits.append(q.soft_bits.item())
+                        
+                        if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers'):
+                            for q in render_kwargs_train["network_fn"].sigma_act_quantizers:
+                                if hasattr(q, 'soft_bits'):
+                                    mlp_bits.append(q.soft_bits.item())
+                        
+                        avg_embed_bits = sum(embed_bits) / len(embed_bits) if embed_bits else 0
+                        avg_mlp_bits = sum(mlp_bits) / len(mlp_bits) if mlp_bits else 0
+                        
+                        tqdm.write(f"[A-CAQ] Avg bits: {avg_bits:.2f} | Embed: {avg_embed_bits:.2f} | MLP: {avg_mlp_bits:.2f}")
+                        tqdm.write(f"[A-CAQ] Current loss: {current_loss:.4f} | Target: {target_metric:.4f}")
+                        
+                        # Show bit distribution
+                        if len(bitwidths) <= 20:  # Only show if not too many
+                            bit_str = " | ".join([f"{b.item():.1f}" for b in bitwidths])
+                            tqdm.write(f"[A-CAQ] Bit distribution: {bit_str}")
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -1011,6 +1092,12 @@ def train():
                 }, path)
             print('Saved checkpoints at', path)
 
+            # Save metrics and generate plots  # ADD THIS COMMENT
+            metrics_logger.save_checkpoint(i)  # ADD THESE LINES
+            metrics_logger.plot_training_curves()
+            if args.use_quantization:
+                metrics_logger.plot_quantization_analysis() 
+
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
@@ -1034,6 +1121,10 @@ def train():
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
+
+            if images is not None and i_test is not None:  # ADD THIS BLOCK
+                test_psnr = -10. * np.log10(np.mean((rgbs - images[i_test])**2))
+                metrics_logger.log_test_metrics(i, test_psnr)  
 
 
 
@@ -1067,7 +1158,14 @@ def train():
                 pickle.dump(loss_psnr_time, fp)
 
         global_step += 1
-
+    # Generate final summary  # ADD THIS COMMENT
+    metrics_logger.save_checkpoint(global_step)  # ADD THESE LINES
+    metrics_logger.plot_training_curves()
+    if args.use_quantization:
+        metrics_logger.plot_quantization_analysis()
+    summary_df = metrics_logger.generate_summary_table()
+    print("\n=== Training Summary ===")
+    print(summary_df) 
 
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
