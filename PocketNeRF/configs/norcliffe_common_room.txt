@@ -1,4 +1,4 @@
-expname = norcliffe_structural_v2_fixed
+expname = norcliffe_structural
 basedir = ./logs
 dataset_type = blender
 
@@ -18,9 +18,13 @@ precrop_frac = 0.5
 
 half_res = False
 
-# PocketNeRF Structural Priors V2 - Anti-Overfitting Configuration
+# *** FIXED CONFIGURATION TO PREVENT BASE OVERFITTING ***
+# Main issue: Normal prediction was enabled before structural priors activated,
+# causing network architecture changes and training instability.
+
+# PocketNeRF Structural Priors V2 - Fixed Configuration
 use_structural_priors = True
-predict_normals = True
+predict_normals = False              # *** DISABLED until base training stabilizes ***
 
 # DRASTICALLY reduced weights to prevent overfitting (20-50x smaller)
 depth_prior_weight = 0.0              # Disabled - causing issues
@@ -38,12 +42,12 @@ structural_loss_ramp_iters = 5000     # 25%
 overfitting_threshold = 5.0          # Very sensitive threshold
 min_structural_weight = 0.00001      # Floor to prevent zero
 
-# Base HashNeRF Anti-Overfitting Settings
-lrate = 1e-4                         # Reduced from default 5e-4 (5x smaller)
-sparse_loss_weight = 5e-10           # Increased sparsity regularization
-tv_loss_weight = 5e-6                # Increased total variation regularization
+# Base HashNeRF Settings - Closer to Original
+lrate = 5e-4                         # *** RESTORED to default (was reduced to 1e-4) ***
+sparse_loss_weight = 1e-10           # Default sparsity regularization
+tv_loss_weight = 1e-6                # Default total variation regularization
 
-# Disable expensive operations to prevent crashes
-i_video = 50000                      # Disable video rendering (was 5000)
-i_weights = 5000                     # Less frequent checkpoints  
-i_testset = 2000                     # More frequent test evaluation
+# Reasonable logging intervals
+i_video = 50000                      # Enable video rendering but less frequent
+i_weights = 5000                     # Checkpoint frequency
+i_testset = 1000                     # Test evaluation frequency

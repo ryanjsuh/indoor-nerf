@@ -19,11 +19,6 @@ from run_nerf_helpers import *
 from optimizer import MultiOptimizer
 from radam import RAdam
 from loss import sigma_sparsity_loss, total_variation_loss
-from structural_priors_v2 import (
-    combine_structural_losses_v2, 
-    ManhattanFrameEstimator, 
-    SemanticPlaneDetector
-)
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -215,10 +210,6 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    # Get quantization parameters from args
-    use_quantization = getattr(args, 'use_quantization', False)
-    quantization_bits = getattr(args, 'quantization_bits', 8)
-
     embed_fn, input_ch = get_embedder(args.multires, args, i=args.i_embed)
     if args.i_embed==1:
         # hashed embedding table
@@ -239,10 +230,7 @@ def create_nerf(args):
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views,
-                        use_quantization=use_quantization,
-                        quantization_bits=quantization_bits,
-                        predict_normals=args.predict_normals).to(device)
+                        input_ch=input_ch, input_ch_views=input_ch_views).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -258,10 +246,7 @@ def create_nerf(args):
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views,
-                        use_quantization=use_quantization,
-                        quantization_bits=quantization_bits,
-                        predict_normals=args.predict_normals).to(device)
+                        input_ch=input_ch, input_ch_views=input_ch_views).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -324,7 +309,6 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
-        'predict_normals' : args.predict_normals,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -340,20 +324,18 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, predict_normals=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
-        raw: [num_rays, num_samples along ray, 4 or 7]. Prediction from model.
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
         z_vals: [num_rays, num_samples along ray]. Integration time.
         rays_d: [num_rays, 3]. Direction of each ray.
-        predict_normals: bool. Whether the model predicts normals.
     Returns:
         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
         disp_map: [num_rays]. Disparity map. Inverse of depth map.
         acc_map: [num_rays]. Sum of weights along each ray.
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
-        normal_map: [num_rays, 3]. Surface normals (if predict_normals=True).
     """
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
@@ -363,25 +345,18 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
-    
-    if predict_normals:
-        sigma = raw[...,3]  # [N_rays, N_samples]
-        normals = raw[...,4:7]  # [N_rays, N_samples, 3]
-    else:
-        sigma = raw[...,3]  # [N_rays, N_samples]
-    
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(sigma.shape) * raw_noise_std
+        noise = torch.randn(raw[...,3].shape) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
-            noise = np.random.rand(*list(sigma.shape)) * raw_noise_std
+            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
     # sigma_loss = sigma_sparsity_loss(raw[...,3])
-    alpha = raw2alpha(sigma + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
@@ -398,13 +373,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     entropy = Categorical(probs=probs).entropy()
     sparsity_loss = entropy
 
-    if predict_normals:
-        # Render normal map using the same weights
-        normal_map = torch.sum(weights[...,None] * normals, -2)  # [N_rays, 3]
-        normal_map = F.normalize(normal_map, dim=-1)  # Ensure unit length
-        return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map
-    else:
-        return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss
+    return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss
 
 
 def render_rays(ray_batch,
@@ -420,8 +389,7 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False,
-                predict_normals=False):
+                pytest=False):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -441,7 +409,6 @@ def render_rays(ray_batch,
       white_bkgd: bool. If True, assume a white background.
       raw_noise_std: ...
       verbose: bool. If True, print more debugging info.
-      predict_normals: bool. If True, predict surface normals.
     Returns:
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       disp_map: [num_rays]. Disparity map. 1 / depth.
@@ -486,20 +453,11 @@ def render_rays(ray_batch,
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
     raw = network_query_fn(pts, viewdirs, network_fn)
-    
-    # Handle normal prediction
-    if predict_normals:
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map = raw2outputs(
-            raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=True)
-    else:
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(
-            raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=False)
+    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
-        if predict_normals:
-            rgb_map_0, depth_map_0, acc_map_0, sparsity_loss_0, normal_map_0 = rgb_map, depth_map, acc_map, sparsity_loss, normal_map
-        else:
-            rgb_map_0, depth_map_0, acc_map_0, sparsity_loss_0 = rgb_map, depth_map, acc_map, sparsity_loss
+
+        rgb_map_0, depth_map_0, acc_map_0, sparsity_loss_0 = rgb_map, depth_map, acc_map, sparsity_loss
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -509,24 +467,12 @@ def render_rays(ray_batch,
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
         run_fn = network_fn if network_fine is None else network_fine
+#         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        if predict_normals:
-            rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, normal_map = raw2outputs(
-                raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=True)
-        else:
-            rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(
-                raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, predict_normals=False)
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'depth_map' : depth_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
-    
-    # Always store points and ray directions for structural priors (needed even without normal prediction)
-    ret['pts'] = pts
-    ret['rays_d'] = rays_d
-    
-    if predict_normals:
-        ret['normal_map'] = normal_map
-
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -535,8 +481,6 @@ def render_rays(ray_batch,
         ret['acc0'] = acc_map_0
         ret['sparsity_loss0'] = sparsity_loss_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
-        if predict_normals:
-            ret['normal0'] = normal_map_0
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
@@ -669,35 +613,7 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--tv-loss-weight", type=float, default=1e-6,
                         help='learning rate')
-    
-    #adding quantization options
-    parser.add_argument("--use_quantization", action='store_true',
-                        help='enable quantization for hash embeddings and MLP')
-    parser.add_argument("--quantization_bits", type=int, default=8,
-                        help='number of bits for quantization (default: 8)')
-    
-    # PocketNeRF structural priors options
-    parser.add_argument("--use_structural_priors", action='store_true',
-                        help='enable structural priors for indoor scenes')
-    parser.add_argument("--predict_normals", action='store_true',
-                        help='enable normal prediction in the network')
-    parser.add_argument("--depth_prior_weight", type=float, default=0.01,
-                        help='weight for depth prior loss')
-    parser.add_argument("--planarity_weight", type=float, default=0.005,
-                        help='weight for planarity constraint loss')
-    parser.add_argument("--manhattan_weight", type=float, default=0.002,
-                        help='weight for Manhattan world assumption loss')
-    parser.add_argument("--normal_consistency_weight", type=float, default=0.001,
-                        help='weight for normal consistency loss')
-    parser.add_argument("--structural_loss_start_iter", type=int, default=2000,
-                        help='iteration to start applying structural losses')
-    parser.add_argument("--structural_loss_ramp_iters", type=int, default=1000,
-                        help='iterations to ramp up structural loss weights')
-    parser.add_argument("--overfitting_threshold", type=float, default=8.0,
-                        help='PSNR gap threshold for overfitting detection')
-    parser.add_argument("--min_structural_weight", type=float, default=0.0001,
-                        help='minimum structural loss weight to prevent going to zero')
-    
+
     return parser
 
 
@@ -896,7 +812,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 20000 + 1
+    N_iters = 50000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -908,29 +824,8 @@ def train():
     loss_list = []
     psnr_list = []
     time_list = []
-    
-    # Initialize structural priors components (V2) with conservative parameters
-    manhattan_estimator = ManhattanFrameEstimator(confidence_threshold=0.4)  # More conservative
-    semantic_detector = SemanticPlaneDetector(normal_threshold=0.5)           # More conservative
-    
-    # PocketNeRF Time Tracking for Final Report
-    time_metrics = {
-        'start_time': time.time(),
-        'structural_priors_start_time': None,
-        'milestones': {},  # PSNR milestone times
-        'convergence_time': None,
-        'iterations_per_second': [],
-        'time_to_milestones': {},  # Time to reach each PSNR threshold
-        'baseline_comparison': {
-            'time_to_20db': None,
-            'time_to_25db': None,
-            'time_to_30db': None,
-        }
-    }
-    
     start = start + 1
     time0 = time.time()
-    iteration_start_time = time.time()
     for i in trange(start, N_iters):
         # Sample random ray batch
         if use_batching:
@@ -1010,145 +905,8 @@ def train():
             if i>1000:
                 args.tv_loss_weight = 0.0
 
-        # Add PocketNeRF structural priors
-        structural_loss_total = 0.0
-        structural_loss_dict = {}
-        
-        if args.use_structural_priors and i >= args.structural_loss_start_iter:
-            # Announce when structural priors first activate
-            if i == args.structural_loss_start_iter:
-                # *** DYNAMICALLY ENABLE NORMAL PREDICTION AT STRUCTURAL PRIORS ACTIVATION ***
-                # This prevents the network architecture from being changed during base training
-                if not args.predict_normals:
-                    print(f"\n🔧 ENABLING NORMAL PREDICTION for structural priors at iteration {i}")
-                    args.predict_normals = True
-                    # Update render kwargs to enable normal prediction
-                    render_kwargs_train['predict_normals'] = True
-                    render_kwargs_test['predict_normals'] = True
-                
-                time_metrics['structural_priors_start_time'] = time.time()
-                structural_activation_time = time_metrics['structural_priors_start_time'] - time_metrics['start_time']
-                
-                print("\n" + "="*80)
-                print(f"🏗️  ACTIVATING POCKETNERF STRUCTURAL PRIORS AT ITERATION {i}")
-                print("="*80)
-                print(f"📋 Configuration:")
-                print(f"   Depth Prior Weight: {args.depth_prior_weight}")
-                print(f"   Planarity Weight: {args.planarity_weight}")
-                print(f"   Manhattan Weight: {args.manhattan_weight}")
-                print(f"   Normal Consistency Weight: {args.normal_consistency_weight}")
-                print(f"   Predict Normals: {args.predict_normals} (dynamically enabled)")
-                print(f"   Ramp Duration: {args.structural_loss_ramp_iters} iterations")
-                print(f"   Overfitting Threshold: {args.overfitting_threshold} dB")
-                print(f"📈 Current Baseline PSNR: {psnr.item():.2f} dB")
-                print(f"⏱️  Time to Activation: {structural_activation_time/60:.1f} minutes")
-                print(f"🎯 Expecting improvement in:")
-                print(f"   - Planar surface quality (walls, floors)")
-                print(f"   - Geometric consistency")
-                print(f"   - Few-shot reconstruction stability")
-                print("="*80 + "\n")
-            
-            # Progressive weight ramping to avoid sudden optimization shocks
-            ramp_progress = min(1.0, (i - args.structural_loss_start_iter) / args.structural_loss_ramp_iters)
-            ramp_factor = 0.1 + 0.9 * ramp_progress  # Start at 10%, ramp to 100%
-            
-            # Improved overfitting detection with more conservative thresholds
-            if i > args.structural_loss_start_iter + 500 and i % 500 == 0 and len(psnr_list) > 50:
-                # More frequent and sensitive overfitting detection
-                recent_train_psnr = np.mean(psnr_list[-20:])  # More recent samples
-                if hasattr(args, '_last_test_psnr') and recent_train_psnr - args._last_test_psnr > args.overfitting_threshold:
-                    print(f"\n⚠️  Overfitting detected at iteration {i}")
-                    print(f"   Train PSNR: {recent_train_psnr:.1f} dB, Last Test: {args._last_test_psnr:.1f} dB")
-                    print(f"   Gap: {recent_train_psnr - args._last_test_psnr:.1f} dB > {args.overfitting_threshold:.1f} dB threshold")
-                    
-                    # More conservative weight reduction - reduce by 30% instead of 50%
-                    reduction_factor = 0.7
-                    args.depth_prior_weight = max(args.min_structural_weight, args.depth_prior_weight * reduction_factor)
-                    args.planarity_weight = max(args.min_structural_weight, args.planarity_weight * reduction_factor)
-                    args.manhattan_weight = max(args.min_structural_weight, args.manhattan_weight * reduction_factor)
-                    args.normal_consistency_weight = max(args.min_structural_weight, args.normal_consistency_weight * reduction_factor)
-                    
-                    print(f"   Reduced weights by {int((1-reduction_factor)*100)}%:")
-                    print(f"   depth={args.depth_prior_weight:.6f}, planarity={args.planarity_weight:.6f}")
-                    print(f"   manhattan={args.manhattan_weight:.6f}, normal_consistency={args.normal_consistency_weight:.6f}")
-                    
-                    # Early stopping if weights become too small
-                    if args.planarity_weight <= args.min_structural_weight * 2:
-                        print(f"   ⚠️  Structural weights very small - consider reducing structural loss contribution")
-            
-            # Prepare ramped structural prior weights  
-            structural_weights = {
-                'depth_prior': args.depth_prior_weight * ramp_factor,
-                'planarity': args.planarity_weight * ramp_factor,
-                'manhattan': args.manhattan_weight * ramp_factor, 
-                'normal_consistency': args.normal_consistency_weight * ramp_factor
-            }
-            
-            # Get required data for structural priors
-            depth_pred = depth
-            normals = extras.get('normal_map', None) if args.predict_normals else None
-            rays_d = extras.get('rays_d', None)
-            points = extras.get('pts', None)
-            
-            if depth_pred is not None:
-                try:
-                    # Get spatial coordinates for spatial awareness
-                    if not use_batching and N_rand is not None:
-                        # Extract 2D coordinates from the ray selection
-                        spatial_coords = select_coords.float()  # [N_rand, 2]
-                    else:
-                        spatial_coords = None
-                    
-                    # Compute structural losses with V2 implementation
-                    structural_loss, structural_loss_dict = combine_structural_losses_v2(
-                        depth_pred=depth_pred,
-                        normals=normals,
-                        rays_d=rays_d,
-                        spatial_coords=spatial_coords,
-                        weights=structural_weights,
-                        manhattan_frame_estimator=manhattan_estimator,
-                        semantic_detector=semantic_detector
-                    )
-                    
-                    structural_loss_total = structural_loss.item() if torch.is_tensor(structural_loss) else structural_loss
-                    loss = loss + structural_loss
-                    
-                    # Enhanced logging for V2 implementation
-                    if i % args.i_print == 0:
-                        floor_count = structural_loss_dict.get('semantic_floor_count', 0)
-                        wall_count = structural_loss_dict.get('semantic_wall_count', 0)
-                        if floor_count > 0 or wall_count > 0:
-                            print(f"   🏗️  Semantics: {floor_count} floor, {wall_count} wall points detected")
-                    
-                    # Log ramping progress
-                    if i % args.i_print == 0 and ramp_progress < 1.0:
-                        print(f"   🔄 Structural weights ramping: {ramp_progress*100:.1f}% complete")
-                    
-                except Exception as e:
-                    # Don't break training if structural priors fail
-                    if i % args.i_print == 0:
-                        print(f"  ⚠️  Structural priors V2 failed: {e}")
-                        print(f"      This is expected during initial iterations as geometry stabilizes")
-
-        elif args.use_structural_priors and i < args.structural_loss_start_iter:
-            # Show countdown to structural priors activation with improved messages
-            if i % args.i_print == 0 and i > args.structural_loss_start_iter - 500:
-                remaining = args.structural_loss_start_iter - i
-                if remaining <= 100:
-                    print(f"  🚀 Structural priors activate in {remaining} iterations...")
-                elif remaining <= 200:
-                    print(f"  📊 Structural priors activate in {remaining} iterations (geometry stabilizing)...")
-                else:
-                    print(f"  📊 Structural priors activate in {remaining} iterations...")
-
         loss.backward()
         # pdb.set_trace()
-        
-        # *** REMOVED GRADIENT CLIPPING THAT WAS CAUSING OVERFITTING ***
-        # The aggressive gradient clipping (max_norm=1.0) was interfering with 
-        # normal training dynamics and making overfitting worse.
-        # torch.nn.utils.clip_grad_norm_(grad_vars, max_norm=1.0)
-        
         optimizer.step()
 
         # NOTE: IMPORTANT!
@@ -1163,50 +921,6 @@ def train():
         t = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
-        
-        # PocketNeRF Time Metrics Collection
-        current_time = time.time()
-        iteration_time = current_time - iteration_start_time
-        time_metrics['iterations_per_second'].append(1.0 / iteration_time if iteration_time > 0 else 0)
-        
-        # Track PSNR milestones for convergence analysis
-        current_psnr = psnr.item()
-        milestones = [15, 20, 25, 30, 35]
-        
-        for milestone in milestones:
-            milestone_key = f'{milestone}db'
-            if current_psnr >= milestone and milestone_key not in time_metrics['milestones']:
-                milestone_time = current_time - time_metrics['start_time']
-                time_metrics['milestones'][milestone_key] = {
-                    'iteration': i,
-                    'time_seconds': milestone_time,
-                    'time_minutes': milestone_time / 60.0
-                }
-                
-                # Special tracking for baseline comparison
-                if milestone == 20:
-                    time_metrics['baseline_comparison']['time_to_20db'] = milestone_time / 60.0
-                elif milestone == 25:
-                    time_metrics['baseline_comparison']['time_to_25db'] = milestone_time / 60.0
-                elif milestone == 30:
-                    time_metrics['baseline_comparison']['time_to_30db'] = milestone_time / 60.0
-                
-                print(f"🎯 MILESTONE: Reached {milestone} dB PSNR at iteration {i} ({milestone_time/60:.1f} min)")
-        
-        # Convergence detection (PSNR hasn't improved significantly in last 1000 iterations)
-        if i > 2000 and len(psnr_list) > 100 and time_metrics['convergence_time'] is None:
-            recent_psnr = psnr_list[-100:]  # Last 100 iterations
-            if len(recent_psnr) >= 100:
-                psnr_std = np.std(recent_psnr)
-                psnr_trend = recent_psnr[-1] - recent_psnr[0]
-                
-                # Converged if: low variance and minimal improvement
-                if psnr_std < 0.5 and abs(psnr_trend) < 0.5:
-                    convergence_time = current_time - time_metrics['start_time']
-                    time_metrics['convergence_time'] = convergence_time / 60.0
-                    print(f"📊 CONVERGENCE DETECTED at iteration {i} ({convergence_time/60:.1f} min)")
-        
-        iteration_start_time = current_time
 
         # Rest is logging
         if i%args.i_weights==0:
@@ -1251,201 +965,23 @@ def train():
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
-            
-            # Additional PocketNeRF evaluation logging
-            if args.use_structural_priors and i >= args.structural_loss_start_iter:
-                print(f"📊 PocketNeRF Status @ {i}:")
-                print(f"   Structural Loss: {structural_loss_total:.6f}")
-                if len(psnr_list) >= 10:
-                    # Compare recent performance to pre-structural priors
-                    pre_struct_idx = max(0, args.structural_loss_start_iter - i_train.shape[0] * 10)
-                    if pre_struct_idx < len(psnr_list):
-                        recent_avg = np.mean(psnr_list[-10:])
-                        pre_struct_avg = np.mean(psnr_list[max(0, pre_struct_idx-10):pre_struct_idx+10])
-                        improvement = recent_avg - pre_struct_avg
-                        status = "📈 Improving" if improvement > 0.5 else "📉 Declining" if improvement < -0.5 else "➡️ Stable"
-                        print(f"   PSNR vs pre-structural: {improvement:+.2f} dB ({status})")
-            
-            # Store last test PSNR for overfitting detection (rough estimate from test renders)
-            if i >= 1000:  # Start tracking after structural priors activate
-                # Rough estimate: test PSNR is typically lower than train, use a heuristic
-                estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Observed ~12dB gap
-                args._last_test_psnr = max(10.0, estimated_test_psnr)  # Floor at 10dB
-            
-            # Early overfitting detection for base HashNeRF (before structural priors)
-            if i >= 1000 and i < args.structural_loss_start_iter:
-                recent_train_psnr = np.mean(psnr_list[-5:])
-                estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Rough estimate
-                
-                # More aggressive overfitting detection for base training
-                base_overfitting_threshold = 10.0  # Stricter threshold for base
-                if recent_train_psnr - estimated_test_psnr > base_overfitting_threshold:
-                    print(f"\n🚨 BASE HASHNERF OVERFITTING DETECTED @ {i} (before structural priors!)")
-                    print(f"   Train PSNR: {recent_train_psnr:.1f} dB")
-                    print(f"   Estimated Test PSNR: {estimated_test_psnr:.1f} dB") 
-                    print(f"   Gap: {recent_train_psnr - estimated_test_psnr:.1f} dB > {base_overfitting_threshold:.1f} dB")
-                    print(f"   ⚠️  This suggests the base model overfits with only {len(i_train)} training views")
-                    print(f"   📋 Consider: lower learning rate, more regularization, or data augmentation")
-                    
-                    # Store this for later reference
-                    args._last_test_psnr = estimated_test_psnr
+
+
 
         if i%args.i_print==0:
-            # Enhanced logging for PocketNeRF monitoring
-            base_msg = f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.2f}"
-            
-            # Add time efficiency metrics
-            if len(time_metrics['iterations_per_second']) > 0:
-                current_speed = time_metrics['iterations_per_second'][-1]
-                avg_speed = np.mean(time_metrics['iterations_per_second'][-100:]) if len(time_metrics['iterations_per_second']) >= 100 else np.mean(time_metrics['iterations_per_second'])
-                elapsed_time = (time.time() - time_metrics['start_time']) / 60.0
-                base_msg += f" | Speed: {avg_speed:.2f}it/s | Time: {elapsed_time:.1f}min"
-            
-            # Add structural priors information
-            if args.use_structural_priors:
-                if i >= args.structural_loss_start_iter:
-                    # Show breakdown of structural losses
-                    struct_msg = f" | Struct: {structural_loss_total:.6f}"
-                    if structural_loss_dict:
-                        components = []
-                        for loss_name, loss_val in structural_loss_dict.items():
-                            if torch.is_tensor(loss_val):
-                                components.append(f"{loss_name}: {loss_val.item():.6f}")
-                        if components:
-                            struct_msg += f" ({', '.join(components)})"
-                    base_msg += struct_msg
-                    
-                    # Check if normals are being predicted
-                    if args.predict_normals and 'normal_map' in extras:
-                        normal_map = extras['normal_map']
-                        normal_magnitude = torch.norm(normal_map, dim=-1).mean()
-                        base_msg += f" | Norm: {normal_magnitude:.3f}"
-                        
-                elif i > args.structural_loss_start_iter - 500:
-                    remaining = args.structural_loss_start_iter - i
-                    base_msg += f" | Struct in: {remaining}"
-            
-            # PSNR trend analysis (every 500 iterations)
-            if i > 0 and i % 500 == 0 and len(psnr_list) > 5:
-                recent_psnr = psnr_list[-5:]  # Last 5 measurements
-                psnr_trend = recent_psnr[-1] - recent_psnr[0]
-                trend_emoji = "📈" if psnr_trend > 0 else "📉" if psnr_trend < -0.1 else "➡️"
-                base_msg += f" | Trend: {trend_emoji} {psnr_trend:+.2f}"
-                
-                # Milestone check
-                if psnr.item() > 25:
-                    base_msg += " 🎯"
-                elif psnr.item() > 20:
-                    base_msg += " ✅"
-            
-            tqdm.write(base_msg)
-            
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)
-            
-            # Save comprehensive training data including time metrics
-            training_data = {
+            loss_psnr_time = {
                 "losses": loss_list,
                 "psnr": psnr_list,
-                "time": time_list,
-                "time_metrics": time_metrics,
-                "structural_priors_enabled": args.use_structural_priors,
-                "config": {
-                    "depth_prior_weight": args.depth_prior_weight,
-                    "planarity_weight": args.planarity_weight,
-                    "manhattan_weight": args.manhattan_weight,
-                    "normal_consistency_weight": args.normal_consistency_weight,
-                    "structural_loss_start_iter": args.structural_loss_start_iter,
-                    "predict_normals": args.predict_normals
-                }
+                "time": time_list
             }
-            
-            with open(os.path.join(basedir, expname, "training_metrics.pkl"), "wb") as fp:
-                pickle.dump(training_data, fp)
-            
-            # Every 1000 iterations, print time efficiency summary
-            if i % 1000 == 0 and i > 0:
-                print(f"\n📊 Time Efficiency Summary @ {i} iterations:")
-                elapsed = (time.time() - time_metrics['start_time']) / 60.0
-                print(f"   Total Time: {elapsed:.1f} minutes")
-                if time_metrics['structural_priors_start_time']:
-                    struct_time = (time.time() - time_metrics['structural_priors_start_time']) / 60.0
-                    print(f"   Time since Structural Priors: {struct_time:.1f} minutes")
-                print(f"   Average Speed: {np.mean(time_metrics['iterations_per_second'][-100:]):.2f} it/s")
-                
-                # Show achieved milestones
-                if time_metrics['milestones']:
-                    print(f"   Milestones Achieved:")
-                    for milestone, data in time_metrics['milestones'].items():
-                        print(f"     {milestone}: {data['time_minutes']:.1f} min (iter {data['iteration']})")
-                print()
+            with open(os.path.join(basedir, expname, "loss_vs_time.pkl"), "wb") as fp:
+                pickle.dump(loss_psnr_time, fp)
 
         global_step += 1
-
-    # Final PocketNeRF Time Metrics Summary for Report
-    final_time = time.time()
-    total_training_time = (final_time - time_metrics['start_time']) / 60.0
-    
-    print("\n" + "="*80)
-    print("🏁 FINAL POCKETNERF TIME EFFICIENCY REPORT")
-    print("="*80)
-    print(f"📊 Training Summary:")
-    print(f"   Total Training Time: {total_training_time:.1f} minutes ({total_training_time/60:.1f} hours)")
-    print(f"   Total Iterations: {N_iters-1}")
-    print(f"   Average Speed: {np.mean(time_metrics['iterations_per_second']):.2f} iterations/second")
-    
-    if time_metrics['structural_priors_start_time']:
-        struct_training_time = (final_time - time_metrics['structural_priors_start_time']) / 60.0
-        pre_struct_time = (time_metrics['structural_priors_start_time'] - time_metrics['start_time']) / 60.0
-        print(f"\n⏱️  Phase Breakdown:")
-        print(f"   Pre-Structural Priors: {pre_struct_time:.1f} min ({args.structural_loss_start_iter} iterations)")
-        print(f"   With Structural Priors: {struct_training_time:.1f} min ({N_iters-1-args.structural_loss_start_iter} iterations)")
-    
-    print(f"\n🎯 PSNR Milestone Timeline:")
-    if time_metrics['milestones']:
-        for milestone in ['15db', '20db', '25db', '30db', '35db']:
-            if milestone in time_metrics['milestones']:
-                data = time_metrics['milestones'][milestone]
-                print(f"   {milestone.upper()}: {data['time_minutes']:.1f} min (iteration {data['iteration']})")
-            else:
-                print(f"   {milestone.upper()}: Not achieved")
-    else:
-        print("   No milestones achieved")
-    
-    if time_metrics['convergence_time']:
-        print(f"\n📈 Convergence Analysis:")
-        print(f"   Convergence Time: {time_metrics['convergence_time']:.1f} minutes")
-        print(f"   Final PSNR: {psnr_list[-1]:.2f} dB")
-    
-    # Save final comprehensive report
-    final_report = {
-        'total_training_time_minutes': total_training_time,
-        'total_training_time_hours': total_training_time / 60.0,
-        'total_iterations': N_iters - 1,
-        'average_speed_its': np.mean(time_metrics['iterations_per_second']),
-        'structural_priors_enabled': args.use_structural_priors,
-        'milestones_achieved': time_metrics['milestones'],
-        'convergence_time_minutes': time_metrics['convergence_time'],
-        'final_psnr': psnr_list[-1] if psnr_list else 0,
-        'baseline_comparison': time_metrics['baseline_comparison'],
-        'config': {
-            'depth_prior_weight': args.depth_prior_weight,
-            'planarity_weight': args.planarity_weight,
-            'manhattan_weight': args.manhattan_weight,
-            'normal_consistency_weight': args.normal_consistency_weight,
-            'structural_loss_start_iter': args.structural_loss_start_iter,
-            'predict_normals': args.predict_normals
-        }
-    }
-    
-    with open(os.path.join(basedir, expname, "final_time_report.pkl"), "wb") as fp:
-        pickle.dump(final_report, fp)
-    
-    print(f"\n💾 Comprehensive time metrics saved to:")
-    print(f"   training_metrics.pkl (detailed iteration data)")
-    print(f"   final_time_report.pkl (summary for report)")
-    print("="*80 + "\n")
 
 
 if __name__=='__main__':
