@@ -898,8 +898,25 @@ def train():
     loss_list = []
     psnr_list = []
     time_list = []
+    
+    # PocketNeRF Time Tracking for Final Report
+    time_metrics = {
+        'start_time': time.time(),
+        'structural_priors_start_time': None,
+        'milestones': {},  # PSNR milestone times
+        'convergence_time': None,
+        'iterations_per_second': [],
+        'time_to_milestones': {},  # Time to reach each PSNR threshold
+        'baseline_comparison': {
+            'time_to_20db': None,
+            'time_to_25db': None,
+            'time_to_30db': None,
+        }
+    }
+    
     start = start + 1
     time0 = time.time()
+    iteration_start_time = time.time()
     for i in trange(start, N_iters):
         # Sample random ray batch
         if use_batching:
@@ -986,6 +1003,9 @@ def train():
         if args.use_structural_priors and i >= args.structural_loss_start_iter:
             # Announce when structural priors first activate
             if i == args.structural_loss_start_iter:
+                time_metrics['structural_priors_start_time'] = time.time()
+                structural_activation_time = time_metrics['structural_priors_start_time'] - time_metrics['start_time']
+                
                 print("\n" + "="*80)
                 print(f"🏗️  ACTIVATING POCKETNERF STRUCTURAL PRIORS AT ITERATION {i}")
                 print("="*80)
@@ -996,6 +1016,7 @@ def train():
                 print(f"   Normal Consistency Weight: {args.normal_consistency_weight}")
                 print(f"   Predict Normals: {args.predict_normals}")
                 print(f"📈 Current Baseline PSNR: {psnr.item():.2f} dB")
+                print(f"⏱️  Time to Activation: {structural_activation_time/60:.1f} minutes")
                 print(f"🎯 Expecting improvement in:")
                 print(f"   - Planar surface quality (walls, floors)")
                 print(f"   - Geometric consistency")
@@ -1077,6 +1098,50 @@ def train():
         t = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
+        
+        # PocketNeRF Time Metrics Collection
+        current_time = time.time()
+        iteration_time = current_time - iteration_start_time
+        time_metrics['iterations_per_second'].append(1.0 / iteration_time if iteration_time > 0 else 0)
+        
+        # Track PSNR milestones for convergence analysis
+        current_psnr = psnr.item()
+        milestones = [15, 20, 25, 30, 35]
+        
+        for milestone in milestones:
+            milestone_key = f'{milestone}db'
+            if current_psnr >= milestone and milestone_key not in time_metrics['milestones']:
+                milestone_time = current_time - time_metrics['start_time']
+                time_metrics['milestones'][milestone_key] = {
+                    'iteration': i,
+                    'time_seconds': milestone_time,
+                    'time_minutes': milestone_time / 60.0
+                }
+                
+                # Special tracking for baseline comparison
+                if milestone == 20:
+                    time_metrics['baseline_comparison']['time_to_20db'] = milestone_time / 60.0
+                elif milestone == 25:
+                    time_metrics['baseline_comparison']['time_to_25db'] = milestone_time / 60.0
+                elif milestone == 30:
+                    time_metrics['baseline_comparison']['time_to_30db'] = milestone_time / 60.0
+                
+                print(f"🎯 MILESTONE: Reached {milestone} dB PSNR at iteration {i} ({milestone_time/60:.1f} min)")
+        
+        # Convergence detection (PSNR hasn't improved significantly in last 1000 iterations)
+        if i > 2000 and len(psnr_list) > 100 and time_metrics['convergence_time'] is None:
+            recent_psnr = psnr_list[-100:]  # Last 100 iterations
+            if len(recent_psnr) >= 100:
+                psnr_std = np.std(recent_psnr)
+                psnr_trend = recent_psnr[-1] - recent_psnr[0]
+                
+                # Converged if: low variance and minimal improvement
+                if psnr_std < 0.5 and abs(psnr_trend) < 0.5:
+                    convergence_time = current_time - time_metrics['start_time']
+                    time_metrics['convergence_time'] = convergence_time / 60.0
+                    print(f"📊 CONVERGENCE DETECTED at iteration {i} ({convergence_time/60:.1f} min)")
+        
+        iteration_start_time = current_time
 
         # Rest is logging
         if i%args.i_weights==0:
@@ -1146,6 +1211,13 @@ def train():
             # Enhanced logging for PocketNeRF monitoring
             base_msg = f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.2f}"
             
+            # Add time efficiency metrics
+            if len(time_metrics['iterations_per_second']) > 0:
+                current_speed = time_metrics['iterations_per_second'][-1]
+                avg_speed = np.mean(time_metrics['iterations_per_second'][-100:]) if len(time_metrics['iterations_per_second']) >= 100 else np.mean(time_metrics['iterations_per_second'])
+                elapsed_time = (time.time() - time_metrics['start_time']) / 60.0
+                base_msg += f" | Speed: {avg_speed:.2f}it/s | Time: {elapsed_time:.1f}min"
+            
             # Add structural priors information
             if args.use_structural_priors:
                 if i >= args.structural_loss_start_iter:
@@ -1188,15 +1260,109 @@ def train():
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)
-            loss_psnr_time = {
+            
+            # Save comprehensive training data including time metrics
+            training_data = {
                 "losses": loss_list,
                 "psnr": psnr_list,
-                "time": time_list
+                "time": time_list,
+                "time_metrics": time_metrics,
+                "structural_priors_enabled": args.use_structural_priors,
+                "config": {
+                    "depth_prior_weight": args.depth_prior_weight,
+                    "planarity_weight": args.planarity_weight,
+                    "manhattan_weight": args.manhattan_weight,
+                    "normal_consistency_weight": args.normal_consistency_weight,
+                    "structural_loss_start_iter": args.structural_loss_start_iter,
+                    "predict_normals": args.predict_normals
+                }
             }
-            with open(os.path.join(basedir, expname, "loss_vs_time.pkl"), "wb") as fp:
-                pickle.dump(loss_psnr_time, fp)
+            
+            with open(os.path.join(basedir, expname, "training_metrics.pkl"), "wb") as fp:
+                pickle.dump(training_data, fp)
+            
+            # Every 1000 iterations, print time efficiency summary
+            if i % 1000 == 0 and i > 0:
+                print(f"\n📊 Time Efficiency Summary @ {i} iterations:")
+                elapsed = (time.time() - time_metrics['start_time']) / 60.0
+                print(f"   Total Time: {elapsed:.1f} minutes")
+                if time_metrics['structural_priors_start_time']:
+                    struct_time = (time.time() - time_metrics['structural_priors_start_time']) / 60.0
+                    print(f"   Time since Structural Priors: {struct_time:.1f} minutes")
+                print(f"   Average Speed: {np.mean(time_metrics['iterations_per_second'][-100:]):.2f} it/s")
+                
+                # Show achieved milestones
+                if time_metrics['milestones']:
+                    print(f"   Milestones Achieved:")
+                    for milestone, data in time_metrics['milestones'].items():
+                        print(f"     {milestone}: {data['time_minutes']:.1f} min (iter {data['iteration']})")
+                print()
 
         global_step += 1
+
+    # Final PocketNeRF Time Metrics Summary for Report
+    final_time = time.time()
+    total_training_time = (final_time - time_metrics['start_time']) / 60.0
+    
+    print("\n" + "="*80)
+    print("🏁 FINAL POCKETNERF TIME EFFICIENCY REPORT")
+    print("="*80)
+    print(f"📊 Training Summary:")
+    print(f"   Total Training Time: {total_training_time:.1f} minutes ({total_training_time/60:.1f} hours)")
+    print(f"   Total Iterations: {N_iters-1}")
+    print(f"   Average Speed: {np.mean(time_metrics['iterations_per_second']):.2f} iterations/second")
+    
+    if time_metrics['structural_priors_start_time']:
+        struct_training_time = (final_time - time_metrics['structural_priors_start_time']) / 60.0
+        pre_struct_time = (time_metrics['structural_priors_start_time'] - time_metrics['start_time']) / 60.0
+        print(f"\n⏱️  Phase Breakdown:")
+        print(f"   Pre-Structural Priors: {pre_struct_time:.1f} min ({args.structural_loss_start_iter} iterations)")
+        print(f"   With Structural Priors: {struct_training_time:.1f} min ({N_iters-1-args.structural_loss_start_iter} iterations)")
+    
+    print(f"\n🎯 PSNR Milestone Timeline:")
+    if time_metrics['milestones']:
+        for milestone in ['15db', '20db', '25db', '30db', '35db']:
+            if milestone in time_metrics['milestones']:
+                data = time_metrics['milestones'][milestone]
+                print(f"   {milestone.upper()}: {data['time_minutes']:.1f} min (iteration {data['iteration']})")
+            else:
+                print(f"   {milestone.upper()}: Not achieved")
+    else:
+        print("   No milestones achieved")
+    
+    if time_metrics['convergence_time']:
+        print(f"\n📈 Convergence Analysis:")
+        print(f"   Convergence Time: {time_metrics['convergence_time']:.1f} minutes")
+        print(f"   Final PSNR: {psnr_list[-1]:.2f} dB")
+    
+    # Save final comprehensive report
+    final_report = {
+        'total_training_time_minutes': total_training_time,
+        'total_training_time_hours': total_training_time / 60.0,
+        'total_iterations': N_iters - 1,
+        'average_speed_its': np.mean(time_metrics['iterations_per_second']),
+        'structural_priors_enabled': args.use_structural_priors,
+        'milestones_achieved': time_metrics['milestones'],
+        'convergence_time_minutes': time_metrics['convergence_time'],
+        'final_psnr': psnr_list[-1] if psnr_list else 0,
+        'baseline_comparison': time_metrics['baseline_comparison'],
+        'config': {
+            'depth_prior_weight': args.depth_prior_weight,
+            'planarity_weight': args.planarity_weight,
+            'manhattan_weight': args.manhattan_weight,
+            'normal_consistency_weight': args.normal_consistency_weight,
+            'structural_loss_start_iter': args.structural_loss_start_iter,
+            'predict_normals': args.predict_normals
+        }
+    }
+    
+    with open(os.path.join(basedir, expname, "final_time_report.pkl"), "wb") as fp:
+        pickle.dump(final_report, fp)
+    
+    print(f"\n💾 Comprehensive time metrics saved to:")
+    print(f"   training_metrics.pkl (detailed iteration data)")
+    print(f"   final_time_report.pkl (summary for report)")
+    print("="*80 + "\n")
 
 
 if __name__=='__main__':
