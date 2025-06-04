@@ -377,7 +377,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
     # Calculate weights sparsity loss
-    probs = torch.cat([weights, (1.0 - weights.sum(-1, keepdims=True)).clamp(min=1e-6)], dim=-1)
+    probs = torch.cat([weights, (1.0 - weights.sum(-1, keepdim=True)).clamp(min=1e-6)], dim=-1)
     entropy = Categorical(probs=probs).entropy()
     sparsity_loss = entropy
 
