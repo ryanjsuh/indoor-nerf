@@ -29,10 +29,10 @@ manhattan_weight = 0.0005             # Was 0.02, now 40x smaller
 normal_consistency_weight = 0.0002    # Was 0.01, now 50x smaller
 
 # MUCH later activation to allow geometry stabilization  
-structural_loss_start_iter = 5000     # 50%
+structural_loss_start_iter = 10000     # 50%
 
 # Progressive ramping for stability
-structural_loss_ramp_iters = 1500     # 25%
+structural_loss_ramp_iters = 5000     # 25%
 
 # Aggressive overfitting detection
 overfitting_threshold = 5.0          # Very sensitive threshold
