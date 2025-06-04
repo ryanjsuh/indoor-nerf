@@ -614,6 +614,22 @@ def config_parser():
     parser.add_argument("--tv-loss-weight", type=float, default=1e-6,
                         help='learning rate')
 
+    # Quantization options
+    parser.add_argument("--use_quantization", action='store_true',
+                        help='enable quantization for hash embeddings and MLP')
+    parser.add_argument("--quantization_bits", type=int, default=8,
+                        help='number of bits for quantization (default: 8)')
+    
+    # A-CAQ specific arguments
+    parser.add_argument("--use_acaq", action='store_true',
+                        help='enable content-aware quantization (A-CAQ)')
+    parser.add_argument("--target_metric", type=float, default=None,
+                        help='target MSE for MGL mode (None for MDL mode)')
+    parser.add_argument("--bit_penalty", type=float, default=1e-3,
+                        help='penalty weight for bitwidth')
+    parser.add_argument("--acaq_start_iter", type=int, default=1000,
+                        help='iteration to start A-CAQ training')
+
     return parser
 
 
@@ -909,6 +925,49 @@ def train():
         # pdb.set_trace()
         optimizer.step()
 
+        # A-CAQ Training (Adversarial Content-Aware Quantization)
+        if args.use_acaq and args.use_quantization and i >= args.acaq_start_iter:
+            # Collect all quantizers
+            quantizers = []
+            if hasattr(render_kwargs_train["embed_fn"], 'quantizers') and render_kwargs_train["embed_fn"].quantizers is not None:
+                quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+            if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers') and render_kwargs_train["network_fn"].sigma_act_quantizers is not None:
+                quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
+            if hasattr(render_kwargs_train["network_fn"], 'sigma_weight_quantizer') and render_kwargs_train["network_fn"].sigma_weight_quantizer is not None:
+                quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
+            
+            if quantizers:  # Only if we have quantizers with learnable bitwidths
+                # Collect bitwidths
+                bitwidths = []
+                for q in quantizers:
+                    if hasattr(q, 'bit_width'):  # LearnedBitwidthQuantizer
+                        bitwidths.append(q.bit_width)
+                
+                if bitwidths:
+                    bitwidths = torch.stack(bitwidths)
+                    avg_bits = bitwidths.mean().item()
+                    
+                    # Compute A-CAQ loss (Eq. 8 from paper)
+                    target_metric = args.target_metric if args.target_metric is not None else img_loss.detach()
+                    accuracy_term = torch.sqrt(torch.abs(img_loss - target_metric) + 1e-8)
+                    bitwidth_term = args.bit_penalty * bitwidths.sum()
+                    bit_loss = accuracy_term + bitwidth_term
+                    
+                    # Optimize bitwidths only
+                    optimizer.zero_grad()
+                    bit_loss.backward()
+                    
+                    # Manual gradient update for bitwidth parameters only
+                    with torch.no_grad():
+                        for q in quantizers:
+                            if hasattr(q, 'soft_bits') and q.soft_bits.grad is not None:
+                                q.soft_bits.data -= new_lrate * q.soft_bits.grad
+                    
+                    # Log every i_print iterations
+                    if i % args.i_print == 0:
+                        tqdm.write(f"[A-CAQ] Bit loss: {bit_loss.item():.4f}, Avg bits: {avg_bits:.2f}")
+
+
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -970,6 +1029,22 @@ def train():
 
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+
+            # Quantization logging
+            if args.use_quantization and i > 0:
+                from quantization import calculate_fqr
+                # Collect all quantizers
+                quantizers = []
+                if hasattr(render_kwargs_train["embed_fn"], 'quantizers'):
+                    quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+                if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers'):
+                    quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
+                    if render_kwargs_train["network_fn"].sigma_weight_quantizer:
+                        quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
+                
+                avg_bits = calculate_fqr(quantizers)
+                tqdm.write(f"[QUANT] Average bits: {avg_bits:.2f}, Num quantizers: {len(quantizers)}")
+
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)
