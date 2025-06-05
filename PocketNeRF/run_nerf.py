@@ -25,7 +25,7 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_scannet import load_scannet_data
 from load_LINEMOD import load_LINEMOD_data
-
+from evaluation_utils import ComprehensiveEvaluator
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -754,6 +754,8 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    evaluator = ComprehensiveEvaluator(device=device)
+
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -962,11 +964,41 @@ def train():
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
+
+            print('Evaluating test set...')
+            
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
-            print('Saved test set')
-
-
+                test_poses_tensor = torch.Tensor(poses[i_test]).to(device)
+                test_images = images[i_test]
+                
+                test_metrics, test_preds, per_image_metrics = evaluator.evaluate_test_set(
+                    render, test_poses_tensor, hwf, K, args.chunk, 
+                    render_kwargs_test, test_images
+                )
+                
+                evaluator.record_test_metrics(i, test_metrics)
+                
+                results = {
+                    'iteration': i,
+                    'avg_metrics': test_metrics,
+                    'per_image_metrics': per_image_metrics
+                }
+                with open(os.path.join(testsavedir, 'detailed_metrics.json'), 'w') as f:
+                    json.dump(results, f, indent=2)
+                
+                for j in range(min(5, len(test_preds))):
+                    imageio.imwrite(
+                        os.path.join(testsavedir, f'pred_{j:03d}.png'),
+                        to8b(test_preds[j])
+                    )
+                print(f'Test PSNR: {test_metrics["psnr"]:.2f} ± {test_metrics["std_psnr"]:.2f}')
+                print(f'Test SSIM: {test_metrics["ssim"]:.3f} ± {test_metrics["std_ssim"]:.3f}')
+                print(f'Test LPIPS: {test_metrics["lpips"]:.3f} ± {test_metrics["std_lpips"]:.3f}')
+            
+            evaluator.record_memory_usage(i)
+            
+            print('Saved test set evaluation')
 
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
@@ -982,6 +1014,44 @@ def train():
                 pickle.dump(loss_psnr_time, fp)
 
         global_step += 1
+
+    with open(os.path.join(basedir, expname, "loss_vs_time.pkl"), "rb") as fp:
+        train_data = pickle.load(fp)
+        evaluator.metrics_history['train']['iter'] = list(range(args.i_print, len(train_data['psnr']) * args.i_print + 1, args.i_print))
+        evaluator.metrics_history['train']['psnr'] = train_data['psnr']
+        evaluator.metrics_history['train']['time'] = train_data['time']
+
+    # Save comprehensive metrics history
+    evaluator.save_metrics(os.path.join(basedir, expname, 'all_metrics_history.pkl'))
+    
+    # Generate final evaluation report
+    print("\nGenerating final evaluation report...")
+    
+    # Final test evaluation
+    with torch.no_grad():
+        test_poses_tensor = torch.Tensor(poses[i_test]).to(device)
+        final_metrics, final_preds, _ = evaluator.evaluate_test_set(
+            render, test_poses_tensor, hwf, K, args.chunk, 
+            render_kwargs_test, images[i_test]
+        )
+    
+    # Save final report
+    final_report = {
+        'experiment': expname,
+        'total_iterations': N_iters,
+        'total_time_seconds': time.time() - time0,
+        'final_test_metrics': final_metrics,
+        'peak_memory_gb': max(evaluator.metrics_history['memory']['allocated_gb']) if evaluator.metrics_history['memory']['allocated_gb'] else 0,
+        'config': vars(args)
+    }
+    
+    with open(os.path.join(basedir, expname, 'final_report.json'), 'w') as f:
+        json.dump(final_report, f, indent=2)
+    
+    print(f"\nFinal Test Results:")
+    print(f"  PSNR: {final_metrics['psnr']:.2f} dB")
+    print(f"  SSIM: {final_metrics['ssim']:.3f}")
+    print(f"  LPIPS: {final_metrics['lpips']:.3f}")
 
 
 if __name__=='__main__':
