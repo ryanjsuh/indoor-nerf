@@ -19,7 +19,7 @@ from run_nerf_helpers import *
 from optimizer import MultiOptimizer
 from radam import RAdam
 from loss import sigma_sparsity_loss, total_variation_loss
-from PocketNeRF.structural_priors import (
+from structural_priors import (
     combine_structural_losses_v2, 
     ManhattanFrameEstimator, 
     SemanticPlaneDetector
