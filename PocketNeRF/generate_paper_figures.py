@@ -15,7 +15,7 @@ def plot_metrics_over_time(metrics, save_path):
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     axes = axes.flatten()
     
-    # Test PSNR vs Iteration
+    # Test PSNR vs Iteration (keep as line plot)
     ax = axes[0]
     if 'train' in metrics and metrics['train']['iter']:
         ax.plot(metrics['train']['iter'], metrics['train']['psnr'], 
@@ -28,30 +28,30 @@ def plot_metrics_over_time(metrics, save_path):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # Test SSIM vs Iteration
+    # Test SSIM vs Iteration (scatter plot)
     ax = axes[1]
-    ax.plot(metrics['test']['iter'], metrics['test']['ssim'], 
-            'r-', linewidth=2)
+    ax.scatter(metrics['test']['iter'], metrics['test']['ssim'], 
+               color='r', s=50, alpha=0.7)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('SSIM')
     ax.set_title('Test SSIM over Training')
     ax.grid(True, alpha=0.3)
     
-    # Test LPIPS vs Iteration
+    # Test LPIPS vs Iteration (scatter plot)
     ax = axes[2]
-    ax.plot(metrics['test']['iter'], metrics['test']['lpips'], 
-            'm-', linewidth=2)
+    ax.scatter(metrics['test']['iter'], metrics['test']['lpips'], 
+               color='m', s=50, alpha=0.7)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('LPIPS')
-    ax.set_title('Test LPIPS over Training (lower is better)')
+    ax.set_title('Test LPIPS over Training')
     ax.grid(True, alpha=0.3)
     
-    # Memory Usage
+    # Memory Usage (scatter plot)
     ax = axes[3]
     if 'memory' in metrics and metrics['memory']['iter']:
-        ax.plot(metrics['memory']['iter'], 
-                metrics['memory']['allocated_gb'], 
-                'c-', linewidth=2)
+        ax.scatter(metrics['memory']['iter'], 
+                   metrics['memory']['allocated_gb'], 
+                   color='c', s=50, alpha=0.7)
         ax.set_xlabel('Iteration')
         ax.set_ylabel('GPU Memory (GB)')
         ax.set_title('GPU Memory Usage')
@@ -136,8 +136,13 @@ if __name__ == '__main__':
     # Try to load final report
     report = None
     if (exp_path / 'final_report.json').exists():
-        with open(exp_path / 'final_report.json', 'r') as f:
-            report = json.load(f)
+        try:
+            with open(exp_path / 'final_report.json', 'r') as f:
+                report = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Warning: final_report.json is corrupted: {e}")
+            print("Continuing with metrics from all_metrics_history.pkl...")
+            report = None
     
     # Generate analysis
     print("Generating metrics plots...")
