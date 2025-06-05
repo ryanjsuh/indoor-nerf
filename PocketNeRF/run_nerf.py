@@ -1456,7 +1456,7 @@ def train():
     }
     
     with open(os.path.join(basedir, expname, 'final_report.json'), 'w') as f:
-        json.dump(final_report_new_format, f, indent=2)
+        json.dump(final_report_new_format, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
     
     print(f"\nFinal Test Results (from new evaluator):")
     print(f"  PSNR: {final_metrics['psnr']:.2f} dB")
