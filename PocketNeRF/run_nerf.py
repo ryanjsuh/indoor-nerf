@@ -30,6 +30,7 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_scannet import load_scannet_data
 from load_LINEMOD import load_LINEMOD_data
+from evaluation_utils import ComprehensiveEvaluator
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -845,6 +846,8 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    evaluator = ComprehensiveEvaluator(device=device) # Added evaluator
+
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -903,7 +906,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 20000 + 1
+    N_iters = 8000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -1246,11 +1249,41 @@ def train():
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
+
+            print('Evaluating test set...') # New evaluation block
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
-            print('Saved test set')
+                test_poses_tensor = torch.Tensor(poses[i_test]).to(device)
+                test_images = images[i_test]
+                
+                test_metrics, test_preds, per_image_metrics = evaluator.evaluate_test_set(
+                    render, test_poses_tensor, hwf, K, args.chunk, 
+                    render_kwargs_test, test_images
+                )
+                
+                evaluator.record_test_metrics(i, test_metrics)
+                
+                results = {
+                    'iteration': i,
+                    'avg_metrics': test_metrics,
+                    'per_image_metrics': per_image_metrics
+                }
+                with open(os.path.join(testsavedir, 'detailed_metrics.json'), 'w') as f:
+                     json.dump(results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
+                
+                for j in range(min(5, len(test_preds))):
+                    imageio.imwrite(
+                        os.path.join(testsavedir, f'pred_{j:03d}.png'),
+                        to8b(test_preds[j])
+                    )
+                print(f'Test PSNR: {test_metrics["psnr"]:.2f} ± {test_metrics["std_psnr"]:.2f}')
+                print(f'Test SSIM: {test_metrics["ssim"]:.3f} ± {test_metrics["std_ssim"]:.3f}')
+                print(f'Test LPIPS: {test_metrics["lpips"]:.3f} ± {test_metrics["std_lpips"]:.3f}')
             
-            # Additional PocketNeRF evaluation logging
+            evaluator.record_memory_usage(i)
+            print('Saved test set evaluation')
+            
+            # Additional PocketNeRF evaluation logging (from old version)
             if args.use_structural_priors and i >= args.structural_loss_start_iter:
                 print(f"📊 PocketNeRF Status @ {i}:")
                 print(f"   Structural Loss: {structural_loss_total:.6f}")
@@ -1342,7 +1375,7 @@ def train():
             psnr_list.append(psnr.item())
             time_list.append(t)
             
-            # Save comprehensive training data including time metrics
+            # Save comprehensive training data including time metrics (from old version)
             training_data = {
                 "losses": loss_list,
                 "psnr": psnr_list,
@@ -1362,7 +1395,16 @@ def train():
             with open(os.path.join(basedir, expname, "training_metrics.pkl"), "wb") as fp:
                 pickle.dump(training_data, fp)
             
-            # Every 1000 iterations, print time efficiency summary
+            # Save loss_vs_time.pkl (from new version)
+            loss_psnr_time = {
+                "losses": loss_list,
+                "psnr": psnr_list,
+                "time": time_list
+            }
+            with open(os.path.join(basedir, expname, "loss_vs_time.pkl"), "wb") as fp:
+                pickle.dump(loss_psnr_time, fp)
+
+            # Every 1000 iterations, print time efficiency summary (from old version)
             if i % 1000 == 0 and i > 0:
                 print(f"\n📊 Time Efficiency Summary @ {i} iterations:")
                 elapsed = (time.time() - time_metrics['start_time']) / 60.0
@@ -1381,7 +1423,48 @@ def train():
 
         global_step += 1
 
-    # Final PocketNeRF Time Metrics Summary for Report
+    # Load loss_vs_time.pkl and populate evaluator metrics (from new version)
+    with open(os.path.join(basedir, expname, "loss_vs_time.pkl"), "rb") as fp:
+        train_data_new = pickle.load(fp)
+        evaluator.metrics_history['train']['iter'] = list(range(args.i_print, len(train_data_new['psnr']) * args.i_print + 1, args.i_print))
+        evaluator.metrics_history['train']['psnr'] = train_data_new['psnr']
+        evaluator.metrics_history['train']['time'] = train_data_new['time']
+
+    # Save comprehensive metrics history (from new version)
+    evaluator.save_metrics(os.path.join(basedir, expname, 'all_metrics_history.pkl'))
+    
+    # Generate final evaluation report (from new version)
+    print("\nGenerating final evaluation report...")
+    
+    # Final test evaluation (from new version)
+    with torch.no_grad():
+        test_poses_tensor = torch.Tensor(poses[i_test]).to(device)
+        test_images = images[i_test] # Ensure test_images is defined for the final evaluation
+        final_metrics, final_preds, _ = evaluator.evaluate_test_set(
+            render, test_poses_tensor, hwf, K, args.chunk, 
+            render_kwargs_test, test_images
+        )
+    
+    # Save final report (from new version)
+    final_report_new_format = {
+        'experiment': expname,
+        'total_iterations': N_iters -1, # Corrected total iterations
+        'total_time_seconds': time.time() - time0,
+        'final_test_metrics': final_metrics,
+        'peak_memory_gb': max(evaluator.metrics_history['memory']['allocated_gb']) if evaluator.metrics_history['memory']['allocated_gb'] else 0,
+        'config': vars(args)
+    }
+    
+    with open(os.path.join(basedir, expname, 'final_report.json'), 'w') as f:
+        json.dump(final_report_new_format, f, indent=2)
+    
+    print(f"\nFinal Test Results (from new evaluator):")
+    print(f"  PSNR: {final_metrics['psnr']:.2f} dB")
+    print(f"  SSIM: {final_metrics['ssim']:.3f}")
+    print(f"  LPIPS: {final_metrics['lpips']:.3f}")
+
+
+    # Final PocketNeRF Time Metrics Summary for Report (from old version)
     final_time = time.time()
     total_training_time = (final_time - time_metrics['start_time']) / 60.0
     
@@ -1416,12 +1499,12 @@ def train():
         print(f"   Convergence Time: {time_metrics['convergence_time']:.1f} minutes")
         print(f"   Final PSNR: {psnr_list[-1]:.2f} dB")
     
-    # Save final comprehensive report
-    final_report = {
+    # Save final comprehensive report (from old - this is final_time_report.pkl)
+    final_report_old_format = {
         'total_training_time_minutes': total_training_time,
         'total_training_time_hours': total_training_time / 60.0,
         'total_iterations': N_iters - 1,
-        'average_speed_its': np.mean(time_metrics['iterations_per_second']),
+        'average_speed_its': np.mean(time_metrics['iterations_per_second']) if time_metrics['iterations_per_second'] else 0,
         'structural_priors_enabled': args.use_structural_priors,
         'milestones_achieved': time_metrics['milestones'],
         'convergence_time_minutes': time_metrics['convergence_time'],
@@ -1438,11 +1521,15 @@ def train():
     }
     
     with open(os.path.join(basedir, expname, "final_time_report.pkl"), "wb") as fp:
-        pickle.dump(final_report, fp)
+        pickle.dump(final_report_old_format, fp)
     
     print(f"\n💾 Comprehensive time metrics saved to:")
     print(f"   training_metrics.pkl (detailed iteration data)")
-    print(f"   final_time_report.pkl (summary for report)")
+    print(f"   final_time_report.pkl (summary for report - old format)")
+    print(f"   loss_vs_time.pkl (losses, psnr, time per print iter)")
+    print(f"   all_metrics_history.pkl (evaluator's comprehensive history)")
+    print(f"   final_report.json (summary for report - new format with test metrics & config)")
+    print(f"   detailed_metrics.json (per testset evaluation, in testset_xxxxx folders)")
     print("="*80 + "\n")
 
 

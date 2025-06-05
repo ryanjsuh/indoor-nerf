@@ -26,9 +26,9 @@ planarity_weight = 0.001
 manhattan_weight = 0.0005             
 normal_consistency_weight = 0.0002    
 
-structural_loss_start_iter = 10000     # 50%
+structural_loss_start_iter = 4000     # 50%
 
-structural_loss_ramp_iters = 5000     # 25%
+structural_loss_ramp_iters = 2000     # 25%
 
 overfitting_threshold = 5.0          
 min_structural_weight = 0.00001      
