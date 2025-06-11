@@ -1,4 +1,4 @@
-expname = norcliffe_baseline
+expname = norcliffe_structural_fixed
 basedir = ./logs
 dataset_type = blender
 
@@ -17,3 +17,26 @@ precrop_iters = 500
 precrop_frac = 0.5
 
 half_res = False
+
+use_structural_priors = True
+predict_normals = True               
+
+depth_prior_weight = 0.0              
+planarity_weight = 0.001              
+manhattan_weight = 0.0005             
+normal_consistency_weight = 0.0002    
+
+structural_loss_start_iter = 4000     # 50%
+
+structural_loss_ramp_iters = 2000     # 25%
+
+overfitting_threshold = 5.0          
+min_structural_weight = 0.00001      
+
+lrate = 5e-4                       
+sparse-loss-weight = 1e-10           
+tv-loss-weight = 1e-6                
+
+i_video = 50000                      
+i_weights = 5000                     
+i_testset = 1000                     
