@@ -22,6 +22,9 @@ class HashEmbedder(nn.Module):
         self.out_dim = self.n_levels * self.n_features_per_level
         self.use_quantization = use_quantization #Added for A-CAQ
 
+        self.warmup_steps = 500
+        self.current_step = 0
+
         self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
 
         self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
@@ -33,8 +36,17 @@ class HashEmbedder(nn.Module):
         
         #Add quantizing for each level if True
         if use_quantization:
+            # self.quantizers = nn.ModuleList([
+            #     FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+            #     for i in range(n_levels)
+            # ])
+
+            # Actual quant coded
             self.quantizers = nn.ModuleList([
-                FakeQuantizer(num_bits=quantization_bits, symmetric=False)
+                LearnedBitwidthQuantizer(init_bits=float(quantization_bits), 
+                                       min_bits=2.0, 
+                                       max_bits=32.0, 
+                                       symmetric=False)
                 for i in range(n_levels)
             ])
         else:
@@ -68,6 +80,9 @@ class HashEmbedder(nn.Module):
         return c
 
     def forward(self, x):
+        if self.training:
+            self.current_step += 1
+
         # x is 3D point position: B x 3
         x_embedded_all = []
         for i in range(self.n_levels):
@@ -80,7 +95,10 @@ class HashEmbedder(nn.Module):
 
             # Apply quantization if applicable
             if self.use_quantization and self.quantizers is not None:
-                voxel_embedds = self.quantizers[i](voxel_embedds)
+                if self.training and self.current_step < self.warmup_steps:
+                    pass
+                else:
+                    voxel_embedds = self.quantizers[i](voxel_embedds)
 
             x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
             x_embedded_all.append(x_embedded)

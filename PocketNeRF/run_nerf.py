@@ -12,9 +12,11 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from tqdm import tqdm, trange
 import pickle
+import glob
 
 import matplotlib.pyplot as plt
 
+from metric_logger import MetricsLogger
 from run_nerf_helpers import *
 from optimizer import MultiOptimizer
 from radam import RAdam
@@ -241,13 +243,14 @@ def create_nerf(args):
                         num_layers_color=3,
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
-                        use_quantization=use_quantization,
-                        quantization_bits=quantization_bits,
-                        predict_normals=args.predict_normals).to(device)
+                        use_quantization=args.use_quantization,
+                        quantization_bits=args.quantization_bits).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                 use_quantization=args.use_quantization,
+                 quantization_bits=args.quantization_bits).to(device)
     grad_vars = list(model.parameters())
 
     model_fine = None
@@ -670,8 +673,8 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--tv-loss-weight", type=float, default=1e-6,
                         help='learning rate')
-    
-    #adding quantization options
+
+    # Quantization options
     parser.add_argument("--use_quantization", action='store_true',
                         help='enable quantization for hash embeddings and MLP')
     parser.add_argument("--quantization_bits", type=int, default=8,
@@ -699,6 +702,16 @@ def config_parser():
     parser.add_argument("--min_structural_weight", type=float, default=0.0001,
                         help='minimum structural loss weight to prevent going to zero')
     
+    # A-CAQ specific arguments
+    parser.add_argument("--use_acaq", action='store_true',
+                        help='enable content-aware quantization (A-CAQ)')
+    parser.add_argument("--target_metric", type=float, default=None,
+                        help='target MSE for MGL mode (None for MDL mode)')
+    parser.add_argument("--bit_penalty", type=float, default=1e-3,
+                        help='penalty weight for bitwidth')
+    parser.add_argument("--acaq_start_iter", type=int, default=1000,
+                        help='iteration to start A-CAQ training')
+
     return parser
 
 
@@ -842,6 +855,7 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    metrics_logger = MetricsLogger(basedir, expname, args)
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -912,6 +926,8 @@ def train():
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
+
+    train.best_loss = float('inf')
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
 
@@ -1143,15 +1159,131 @@ def train():
                     print(f"  📊 Structural priors activate in {remaining} iterations...")
 
         loss.backward()
-        # pdb.set_trace()
-        
-        # *** REMOVED GRADIENT CLIPPING THAT WAS CAUSING OVERFITTING ***
-        # The aggressive gradient clipping (max_norm=1.0) was interfering with 
-        # normal training dynamics and making overfitting worse.
-        # torch.nn.utils.clip_grad_norm_(grad_vars, max_norm=1.0)
-        
         optimizer.step()
 
+        # Log training metrics  # ADD THIS COMMENT
+        if args.use_quantization:  # ADD THIS BLOCK
+            quantizers = {
+                'embed': render_kwargs_train["embed_fn"].quantizers if hasattr(render_kwargs_train["embed_fn"], 'quantizers') else None,
+                'network': render_kwargs_train["network_fn"].sigma_act_quantizers if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers') else None
+            }
+        else:
+            quantizers = None
+
+        metrics_logger.log_iteration(iteration=i,
+            time_elapsed=time.time() - time0,
+            loss=loss.item(),
+            psnr=psnr.item(),
+            lr=optimizer.param_groups[0]['lr'],
+            quantizers=quantizers
+        )
+
+        # A-CAQ Training (Adversarial Content-Aware Quantization)
+        if args.use_acaq and args.use_quantization and i >= args.acaq_start_iter:
+            # Collect all quantizers
+            quantizers = []
+            
+            # Get quantizers from hash embeddings
+            if hasattr(render_kwargs_train["embed_fn"], 'quantizers') and render_kwargs_train["embed_fn"].quantizers is not None:
+                quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+            
+            # Get quantizers from network
+            if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers') and render_kwargs_train["network_fn"].sigma_act_quantizers is not None:
+                quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
+            if hasattr(render_kwargs_train["network_fn"], 'sigma_weight_quantizer') and render_kwargs_train["network_fn"].sigma_weight_quantizer is not None:
+                quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
+            
+            if quantizers and len(quantizers) > 0:
+                # Calculate average bits and current loss
+                bitwidths = []
+                for q in quantizers:
+                    if hasattr(q, 'bit_width'):
+                        bitwidths.append(q.bit_width)
+                    elif hasattr(q, 'soft_bits'):
+                        bitwidths.append(q.soft_bits)
+                
+                if bitwidths:
+                    bitwidths = torch.stack(bitwidths)
+                    avg_bits = bitwidths.mean().item()
+                    
+                    # Update bitwidths every 10 iterations
+                    if i % 10 == 0:
+                        current_loss = img_loss.item()
+                        
+                        # Determine target based on mode
+                        if args.target_metric is not None:
+                            target_metric = args.target_metric
+                        else:
+                            # MDL mode: try to maintain quality while reducing bits
+                            # Use slightly worse than best achieved loss
+                            if not hasattr(train, 'best_loss'):
+                                train.best_loss = current_loss
+                            train.best_loss = min(train.best_loss, current_loss)
+                            target_metric = train.best_loss * 1.2  # Allow 20% degradation
+                        
+                        # Update each quantizer's bitwidth
+                        with torch.no_grad():
+                            for idx, q in enumerate(quantizers):
+                                if hasattr(q, 'soft_bits'):
+                                    current_bits = q.soft_bits.item()
+                                    # Current performance vs target
+                                    loss_ratio = current_loss / target_metric
+                                    
+                                    # Adaptive bit adjustment based on performance
+                                    if loss_ratio < 0.95:  # Better than target
+                                        bit_delta = -0.3
+                                    elif loss_ratio < 1.05:  # Close to target
+                                        bit_delta = -0.1
+                                    else:  # Worse than target
+                                        bit_delta = 0.2
+                                    
+                                    # Apply bit penalty to encourage lower bits
+                                    bit_penalty = args.bit_penalty * current_bits / 8.0
+                                    bit_delta -= bit_penalty
+
+                                    # ADD FIX 3 HERE: Add layer-wise variation
+                                    layer_factor = 1.0 + (idx - len(quantizers)/2) * 0.02  # Slight variation per layer
+                                    bit_delta *= layer_factor
+                                    
+                                    # Update bitwidth
+                                    q.soft_bits.data += bit_delta
+                                    
+                                    # Clamp to valid range
+                                    q.soft_bits.data = torch.clamp(q.soft_bits.data, q.min_bits, q.max_bits)
+                    # Log A-CAQ update  # ADD THIS COMMENT
+                    metrics_logger.log_acaq_update(  # ADD THIS BLOCK
+                        target_metric=target_metric,
+                        loss_ratio=loss_ratio,
+                        bit_adjustments=[q.soft_bits.item() for q in quantizers if hasattr(q, 'soft_bits')]
+                    )  # END OF ADDED BLOCK
+                    
+
+                    # Log every i_print iterations
+                    if i % args.i_print == 0:
+                        # Calculate per-component bitwidths
+                        embed_bits = []
+                        mlp_bits = []
+                        
+                        if hasattr(render_kwargs_train["embed_fn"], 'quantizers'):
+                            for q in render_kwargs_train["embed_fn"].quantizers:
+                                if hasattr(q, 'soft_bits'):
+                                    embed_bits.append(q.soft_bits.item())
+                        
+                        if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers'):
+                            for q in render_kwargs_train["network_fn"].sigma_act_quantizers:
+                                if hasattr(q, 'soft_bits'):
+                                    mlp_bits.append(q.soft_bits.item())
+                        
+                        avg_embed_bits = sum(embed_bits) / len(embed_bits) if embed_bits else 0
+                        avg_mlp_bits = sum(mlp_bits) / len(mlp_bits) if mlp_bits else 0
+                        
+                        tqdm.write(f"[A-CAQ] Avg bits: {avg_bits:.2f} | Embed: {avg_embed_bits:.2f} | MLP: {avg_mlp_bits:.2f}")
+                        tqdm.write(f"[A-CAQ] Current loss: {current_loss:.4f} | Target: {target_metric:.4f}")
+                        
+                        # Show bit distribution
+                        if len(bitwidths) <= 20:  # Only show if not too many
+                            bit_str = " | ".join([f"{b.item():.1f}" for b in bitwidths])
+                            tqdm.write(f"[A-CAQ] Bit distribution: {bit_str}")
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -1229,6 +1361,12 @@ def train():
                 }, path)
             print('Saved checkpoints at', path)
 
+            # Save metrics and generate plots  # ADD THIS COMMENT
+            metrics_logger.save_checkpoint(i)  # ADD THESE LINES
+            metrics_logger.plot_training_curves()
+            if args.use_quantization:
+                metrics_logger.plot_quantization_analysis() 
+
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
@@ -1253,124 +1391,37 @@ def train():
             print('Evaluating test set...') # New evaluation block
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
-                test_poses_tensor = torch.Tensor(poses[i_test]).to(device)
-                test_images = images[i_test]
-                
-                test_metrics, test_preds, per_image_metrics = evaluator.evaluate_test_set(
-                    render, test_poses_tensor, hwf, K, args.chunk, 
-                    render_kwargs_test, test_images
-                )
-                
-                evaluator.record_test_metrics(i, test_metrics)
-                
-                results = {
-                    'iteration': i,
-                    'avg_metrics': test_metrics,
-                    'per_image_metrics': per_image_metrics
-                }
-                with open(os.path.join(testsavedir, 'detailed_metrics.json'), 'w') as f:
-                     json.dump(results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
-                
-                for j in range(min(5, len(test_preds))):
-                    imageio.imwrite(
-                        os.path.join(testsavedir, f'pred_{j:03d}.png'),
-                        to8b(test_preds[j])
-                    )
-                print(f'Test PSNR: {test_metrics["psnr"]:.2f} ± {test_metrics["std_psnr"]:.2f}')
-                print(f'Test SSIM: {test_metrics["ssim"]:.3f} ± {test_metrics["std_ssim"]:.3f}')
-                print(f'Test LPIPS: {test_metrics["lpips"]:.3f} ± {test_metrics["std_lpips"]:.3f}')
+            print('Saved test set')
+
             
-            evaluator.record_memory_usage(i)
-            print('Saved test set evaluation')
+            psnr_files = glob.glob(os.path.join(testsavedir, "test_psnrs_avg*.pkl"))
+            if psnr_files and len(psnr_files) > 0:
+                with open(psnr_files[0], 'rb') as f:
+                    test_psnrs = pickle.load(f)
+                    avg_test_psnr = sum(test_psnrs) / len(test_psnrs)
+                    metrics_logger.log_test_metrics(i, avg_test_psnr)
+                    print(f"Logged test PSNR: {avg_test_psnr:.2f}")
             
-            # Additional PocketNeRF evaluation logging (from old version)
-            if args.use_structural_priors and i >= args.structural_loss_start_iter:
-                print(f"📊 PocketNeRF Status @ {i}:")
-                print(f"   Structural Loss: {structural_loss_total:.6f}")
-                if len(psnr_list) >= 10:
-                    # Compare recent performance to pre-structural priors
-                    pre_struct_idx = max(0, args.structural_loss_start_iter - i_train.shape[0] * 10)
-                    if pre_struct_idx < len(psnr_list):
-                        recent_avg = np.mean(psnr_list[-10:])
-                        pre_struct_avg = np.mean(psnr_list[max(0, pre_struct_idx-10):pre_struct_idx+10])
-                        improvement = recent_avg - pre_struct_avg
-                        status = "📈 Improving" if improvement > 0.5 else "📉 Declining" if improvement < -0.5 else "➡️ Stable"
-                        print(f"   PSNR vs pre-structural: {improvement:+.2f} dB ({status})")
-            
-            # Store last test PSNR for overfitting detection (rough estimate from test renders)
-            if i >= 1000:  # Start tracking after structural priors activate
-                # Rough estimate: test PSNR is typically lower than train, use a heuristic
-                estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Observed ~12dB gap
-                args._last_test_psnr = max(10.0, estimated_test_psnr)  # Floor at 10dB
-            
-            # Early overfitting detection for base HashNeRF (before structural priors)
-            if i >= 1000 and i < args.structural_loss_start_iter:
-                recent_train_psnr = np.mean(psnr_list[-5:])
-                estimated_test_psnr = np.mean(psnr_list[-5:]) - 12  # Rough estimate
-                
-                # More aggressive overfitting detection for base training
-                base_overfitting_threshold = 10.0  # Stricter threshold for base
-                if recent_train_psnr - estimated_test_psnr > base_overfitting_threshold:
-                    print(f"\n🚨 BASE HASHNERF OVERFITTING DETECTED @ {i} (before structural priors!)")
-                    print(f"   Train PSNR: {recent_train_psnr:.1f} dB")
-                    print(f"   Estimated Test PSNR: {estimated_test_psnr:.1f} dB") 
-                    print(f"   Gap: {recent_train_psnr - estimated_test_psnr:.1f} dB > {base_overfitting_threshold:.1f} dB")
-                    print(f"   ⚠️  This suggests the base model overfits with only {len(i_train)} training views")
-                    print(f"   📋 Consider: lower learning rate, more regularization, or data augmentation")
-                    
-                    # Store this for later reference
-                    args._last_test_psnr = estimated_test_psnr
+
 
         if i%args.i_print==0:
-            # Enhanced logging for PocketNeRF monitoring
-            base_msg = f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.2f}"
-            
-            # Add time efficiency metrics
-            if len(time_metrics['iterations_per_second']) > 0:
-                current_speed = time_metrics['iterations_per_second'][-1]
-                avg_speed = np.mean(time_metrics['iterations_per_second'][-100:]) if len(time_metrics['iterations_per_second']) >= 100 else np.mean(time_metrics['iterations_per_second'])
-                elapsed_time = (time.time() - time_metrics['start_time']) / 60.0
-                base_msg += f" | Speed: {avg_speed:.2f}it/s | Time: {elapsed_time:.1f}min"
-            
-            # Add structural priors information
-            if args.use_structural_priors:
-                if i >= args.structural_loss_start_iter:
-                    # Show breakdown of structural losses
-                    struct_msg = f" | Struct: {structural_loss_total:.6f}"
-                    if structural_loss_dict:
-                        components = []
-                        for loss_name, loss_val in structural_loss_dict.items():
-                            if torch.is_tensor(loss_val):
-                                components.append(f"{loss_name}: {loss_val.item():.6f}")
-                        if components:
-                            struct_msg += f" ({', '.join(components)})"
-                    base_msg += struct_msg
-                    
-                    # Check if normals are being predicted
-                    if args.predict_normals and 'normal_map' in extras:
-                        normal_map = extras['normal_map']
-                        normal_magnitude = torch.norm(normal_map, dim=-1).mean()
-                        base_msg += f" | Norm: {normal_magnitude:.3f}"
-                        
-                elif i > args.structural_loss_start_iter - 500:
-                    remaining = args.structural_loss_start_iter - i
-                    base_msg += f" | Struct in: {remaining}"
-            
-            # PSNR trend analysis (every 500 iterations)
-            if i > 0 and i % 500 == 0 and len(psnr_list) > 5:
-                recent_psnr = psnr_list[-5:]  # Last 5 measurements
-                psnr_trend = recent_psnr[-1] - recent_psnr[0]
-                trend_emoji = "📈" if psnr_trend > 0 else "📉" if psnr_trend < -0.1 else "➡️"
-                base_msg += f" | Trend: {trend_emoji} {psnr_trend:+.2f}"
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+
+            # Quantization logging
+            if args.use_quantization and i > 0:
+                from quantization import calculate_fqr
+                # Collect all quantizers
+                quantizers = []
+                if hasattr(render_kwargs_train["embed_fn"], 'quantizers'):
+                    quantizers.extend(render_kwargs_train["embed_fn"].quantizers)
+                if hasattr(render_kwargs_train["network_fn"], 'sigma_act_quantizers'):
+                    quantizers.extend(render_kwargs_train["network_fn"].sigma_act_quantizers)
+                    if render_kwargs_train["network_fn"].sigma_weight_quantizer:
+                        quantizers.append(render_kwargs_train["network_fn"].sigma_weight_quantizer)
                 
-                # Milestone check
-                if psnr.item() > 25:
-                    base_msg += " 🎯"
-                elif psnr.item() > 20:
-                    base_msg += " ✅"
-            
-            tqdm.write(base_msg)
-            
+                avg_bits = calculate_fqr(quantizers)
+                tqdm.write(f"[QUANT] Average bits: {avg_bits:.2f}, Num quantizers: {len(quantizers)}")
+
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)
@@ -1422,116 +1473,14 @@ def train():
                 print()
 
         global_step += 1
-
-    # Load loss_vs_time.pkl and populate evaluator metrics (from new version)
-    with open(os.path.join(basedir, expname, "loss_vs_time.pkl"), "rb") as fp:
-        train_data_new = pickle.load(fp)
-        evaluator.metrics_history['train']['iter'] = list(range(args.i_print, len(train_data_new['psnr']) * args.i_print + 1, args.i_print))
-        evaluator.metrics_history['train']['psnr'] = train_data_new['psnr']
-        evaluator.metrics_history['train']['time'] = train_data_new['time']
-
-    # Save comprehensive metrics history (from new version)
-    evaluator.save_metrics(os.path.join(basedir, expname, 'all_metrics_history.pkl'))
-    
-    # Generate final evaluation report (from new version)
-    print("\nGenerating final evaluation report...")
-    
-    # Final test evaluation (from new version)
-    with torch.no_grad():
-        test_poses_tensor = torch.Tensor(poses[i_test]).to(device)
-        test_images = images[i_test] # Ensure test_images is defined for the final evaluation
-        final_metrics, final_preds, _ = evaluator.evaluate_test_set(
-            render, test_poses_tensor, hwf, K, args.chunk, 
-            render_kwargs_test, test_images
-        )
-    
-    # Save final report (from new version)
-    final_report_new_format = {
-        'experiment': expname,
-        'total_iterations': N_iters -1, # Corrected total iterations
-        'total_time_seconds': time.time() - time0,
-        'final_test_metrics': final_metrics,
-        'peak_memory_gb': max(evaluator.metrics_history['memory']['allocated_gb']) if evaluator.metrics_history['memory']['allocated_gb'] else 0,
-        'config': vars(args)
-    }
-    
-    with open(os.path.join(basedir, expname, 'final_report.json'), 'w') as f:
-        json.dump(final_report_new_format, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
-    
-    print(f"\nFinal Test Results (from new evaluator):")
-    print(f"  PSNR: {final_metrics['psnr']:.2f} dB")
-    print(f"  SSIM: {final_metrics['ssim']:.3f}")
-    print(f"  LPIPS: {final_metrics['lpips']:.3f}")
-
-
-    # Final PocketNeRF Time Metrics Summary for Report (from old version)
-    final_time = time.time()
-    total_training_time = (final_time - time_metrics['start_time']) / 60.0
-    
-    print("\n" + "="*80)
-    print("🏁 FINAL POCKETNERF TIME EFFICIENCY REPORT")
-    print("="*80)
-    print(f"📊 Training Summary:")
-    print(f"   Total Training Time: {total_training_time:.1f} minutes ({total_training_time/60:.1f} hours)")
-    print(f"   Total Iterations: {N_iters-1}")
-    print(f"   Average Speed: {np.mean(time_metrics['iterations_per_second']):.2f} iterations/second")
-    
-    if time_metrics['structural_priors_start_time']:
-        struct_training_time = (final_time - time_metrics['structural_priors_start_time']) / 60.0
-        pre_struct_time = (time_metrics['structural_priors_start_time'] - time_metrics['start_time']) / 60.0
-        print(f"\n⏱️  Phase Breakdown:")
-        print(f"   Pre-Structural Priors: {pre_struct_time:.1f} min ({args.structural_loss_start_iter} iterations)")
-        print(f"   With Structural Priors: {struct_training_time:.1f} min ({N_iters-1-args.structural_loss_start_iter} iterations)")
-    
-    print(f"\n🎯 PSNR Milestone Timeline:")
-    if time_metrics['milestones']:
-        for milestone in ['15db', '20db', '25db', '30db', '35db']:
-            if milestone in time_metrics['milestones']:
-                data = time_metrics['milestones'][milestone]
-                print(f"   {milestone.upper()}: {data['time_minutes']:.1f} min (iteration {data['iteration']})")
-            else:
-                print(f"   {milestone.upper()}: Not achieved")
-    else:
-        print("   No milestones achieved")
-    
-    if time_metrics['convergence_time']:
-        print(f"\n📈 Convergence Analysis:")
-        print(f"   Convergence Time: {time_metrics['convergence_time']:.1f} minutes")
-        print(f"   Final PSNR: {psnr_list[-1]:.2f} dB")
-    
-    # Save final comprehensive report (from old - this is final_time_report.pkl)
-    final_report_old_format = {
-        'total_training_time_minutes': total_training_time,
-        'total_training_time_hours': total_training_time / 60.0,
-        'total_iterations': N_iters - 1,
-        'average_speed_its': np.mean(time_metrics['iterations_per_second']) if time_metrics['iterations_per_second'] else 0,
-        'structural_priors_enabled': args.use_structural_priors,
-        'milestones_achieved': time_metrics['milestones'],
-        'convergence_time_minutes': time_metrics['convergence_time'],
-        'final_psnr': psnr_list[-1] if psnr_list else 0,
-        'baseline_comparison': time_metrics['baseline_comparison'],
-        'config': {
-            'depth_prior_weight': args.depth_prior_weight,
-            'planarity_weight': args.planarity_weight,
-            'manhattan_weight': args.manhattan_weight,
-            'normal_consistency_weight': args.normal_consistency_weight,
-            'structural_loss_start_iter': args.structural_loss_start_iter,
-            'predict_normals': args.predict_normals
-        }
-    }
-    
-    with open(os.path.join(basedir, expname, "final_time_report.pkl"), "wb") as fp:
-        pickle.dump(final_report_old_format, fp)
-    
-    print(f"\n💾 Comprehensive time metrics saved to:")
-    print(f"   training_metrics.pkl (detailed iteration data)")
-    print(f"   final_time_report.pkl (summary for report - old format)")
-    print(f"   loss_vs_time.pkl (losses, psnr, time per print iter)")
-    print(f"   all_metrics_history.pkl (evaluator's comprehensive history)")
-    print(f"   final_report.json (summary for report - new format with test metrics & config)")
-    print(f"   detailed_metrics.json (per testset evaluation, in testset_xxxxx folders)")
-    print("="*80 + "\n")
-
+    # Generate final summary  # ADD THIS COMMENT
+    metrics_logger.save_checkpoint(global_step)  # ADD THESE LINES
+    metrics_logger.plot_training_curves()
+    if args.use_quantization:
+        metrics_logger.plot_quantization_analysis()
+    summary_df = metrics_logger.generate_summary_table()
+    print("\n=== Training Summary ===")
+    print(summary_df) 
 
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
